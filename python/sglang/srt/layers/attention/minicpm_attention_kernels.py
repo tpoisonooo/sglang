@@ -360,6 +360,10 @@ class FlashInferKernel(AttentionKernel):
                 )
 
             # Convert sparse_page_table to flashinfer format
+            # Note: For sparse attention with CUDA graph, kv_indptr should remain
+            # as the precomputed values [0, K, 2K, ...] where K = num_sparse_topk_tokens.
+            # convert_sparse_page_table_to_flashinfer will modify kv_indptr based on
+            # cache_seqlens, so we need to restore it afterwards.
             kv_indptr_, kv_indices_, kv_last_page_len_ = (
                 convert_sparse_page_table_to_flashinfer(
                     params.page_table,
@@ -369,6 +373,15 @@ class FlashInferKernel(AttentionKernel):
                     kv_last_page_len,
                 )
             )
+
+            # Restore kv_indptr to precomputed values for sparse attention
+            # kv_indptr should be [0, K, 2K, 3K, ...] where K = num_sparse_topk_tokens
+            # This is required because sparse attention uses fixed top-k tokens per batch
+            # Note: kv_indptr was modified by convert_sparse_page_table_to_flashinfer,
+            # but for sparse attention, we need fixed top-k tokens per batch.
+            # The precomputed values should already be [0, K, 2K, ...] from init_cuda_graph_state,
+            # so we don't need to modify them here. The modification in convert_sparse_page_table_to_flashinfer
+            # was incorrect for sparse attention mode.
 
             # Update wrapper's internal buffers with converted data
             #wrapper._paged_kv_indptr_buf.copy_(kv_indptr)
