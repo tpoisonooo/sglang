@@ -20,6 +20,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+try:
+    import triton
+    import triton.language as tl
+    HAS_TRITON = True
+except ImportError:
+    HAS_TRITON = False
+
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import SimpleGLAAttnBackend
@@ -29,6 +36,7 @@ from sglang.srt.layers.attention.minicpm_sparse_utils import (
     SparseMetadata,
     SparseMetadataBuilder,
 )
+from sglang.srt.models.minicpm_fused_norm_rope import fused_rms_norm_rope
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -47,7 +55,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
-
 
 class MiniCPMMLP(nn.Module):
     def __init__(
@@ -198,6 +205,7 @@ class MiniCPMAttention(nn.Module):
         return output
 
 
+
 class MiniCPMLightningMixer(nn.Module):
     """Lightning attention mixer that uses SimpleGLAAttnBackend.
 
@@ -293,6 +301,7 @@ class MiniCPMLightningMixer(nn.Module):
             )
 
         if self.qk_norm:
+            # Keep original norms for weight loading compatibility
             self.q_norm = RMSNorm(self.head_dim, eps=self.rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=self.rms_norm_eps)
 
@@ -307,7 +316,7 @@ class MiniCPMLightningMixer(nn.Module):
 
         self.layer_id = layer_id
         self.state_shape = (self.num_kv_heads, self.head_dim, self.head_dim)
-
+        
     def forward(
         self,
         positions: torch.Tensor,
@@ -315,41 +324,37 @@ class MiniCPMLightningMixer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         
-        # TODO: fuse qk_norm+rotary_emb
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states)  # [seq_len, hidden_size] -> [seq_len, q_size+kv_size+kv_size]
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        if self.qk_norm:
-            q = self.q_norm(q.reshape(-1, self.head_dim))
-            k = self.k_norm(k.reshape(-1, self.head_dim))
+        if self.qk_norm and self.use_rope and HAS_TRITON:
+            # Use fused RMSNorm + RoPE kernel
+            # Get cos_sin_cache from rotary_emb (already in FP32)
+            cos_sin_cache = self.rotary_emb.cos_sin_cache  # [max_position, head_dim * 2]
+            q, k = fused_rms_norm_rope(
+                q=q,
+                k=k,
+                positions=positions,
+                cos_sin_cache=cos_sin_cache,
+                q_norm_weight=self.q_norm.weight,
+                k_norm_weight=self.k_norm.weight,
+                eps=self.rms_norm_eps,
+            )
         else:
-            pdb.set_trace()
-            print('!!!!not self.qk_norm')
-
-        if self.use_rope:
-            q = q.reshape(-1, self.num_heads * self.head_dim)
-            k = k.reshape(-1, self.num_kv_heads * self.head_dim)
+        # if True:
+            # Fallback to original implementation
+            q = self.q_norm(q.contiguous().view(-1, self.head_dim))
+            k = self.k_norm(k.contiguous().view(-1, self.head_dim))
+            q = q.view(-1, self.num_heads * self.head_dim)
+            k = k.view(-1, self.num_kv_heads * self.head_dim)
+        
             orig_dtype = q.dtype
             q, k = q.float(), k.float()
             q, k = self.rotary_emb(positions, q, k)
-            q, k = q.to(orig_dtype), k.to(orig_dtype)
-        else:
-            pdb.set_trace()
-            print('!!!!not use rope')
+            q = q.to(orig_dtype).view(1, -1, self.num_heads, self.head_dim).contiguous()
+            k = k.to(orig_dtype).view(1, -1, self.num_kv_heads, self.head_dim).contiguous()
 
-        if False:
-            q = q.reshape(-1, self.num_heads, self.head_dim)
-            k = k.reshape(-1, self.num_kv_heads, self.head_dim)
-            v = v.reshape(-1, self.num_kv_heads, self.head_dim)
-
-            # ALWAYS unsqueeze to (1, total_tokens, h, d)
-            q = q.unsqueeze(0)  # (1, total_tokens, num_heads, head_dim)
-            k = k.unsqueeze(0)
-            v = v.unsqueeze(0)
-        else:
-            q = q.view(1, -1, self.num_heads, self.head_dim)
-            k = k.view(1, -1, self.num_kv_heads, self.head_dim)
-            v = v.view(1, -1, self.num_kv_heads, self.head_dim)
+        v = v.reshape(1, -1, self.num_kv_heads, self.head_dim)
 
         # Get backend from forward batch
         attn_backend = forward_batch.attn_backend
