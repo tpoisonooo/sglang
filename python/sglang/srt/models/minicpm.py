@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Inference-only MiniCPM model compatible with HuggingFace weights."""
-
+import pdb
 import math
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -314,12 +314,17 @@ class MiniCPMLightningMixer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        
+        # TODO: fuse qk_norm+rotary_emb
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         if self.qk_norm:
             q = self.q_norm(q.reshape(-1, self.head_dim))
             k = self.k_norm(k.reshape(-1, self.head_dim))
+        else:
+            pdb.set_trace()
+            print('!!!!not self.qk_norm')
 
         if self.use_rope:
             q = q.reshape(-1, self.num_heads * self.head_dim)
@@ -328,15 +333,23 @@ class MiniCPMLightningMixer(nn.Module):
             q, k = q.float(), k.float()
             q, k = self.rotary_emb(positions, q, k)
             q, k = q.to(orig_dtype), k.to(orig_dtype)
+        else:
+            pdb.set_trace()
+            print('!!!!not use rope')
 
-        q = q.reshape(-1, self.num_heads, self.head_dim)
-        k = k.reshape(-1, self.num_kv_heads, self.head_dim)
-        v = v.reshape(-1, self.num_kv_heads, self.head_dim)
+        if False:
+            q = q.reshape(-1, self.num_heads, self.head_dim)
+            k = k.reshape(-1, self.num_kv_heads, self.head_dim)
+            v = v.reshape(-1, self.num_kv_heads, self.head_dim)
 
-        # ALWAYS unsqueeze to (1, total_tokens, h, d)
-        q = q.unsqueeze(0)  # (1, total_tokens, num_heads, head_dim)
-        k = k.unsqueeze(0)
-        v = v.unsqueeze(0)
+            # ALWAYS unsqueeze to (1, total_tokens, h, d)
+            q = q.unsqueeze(0)  # (1, total_tokens, num_heads, head_dim)
+            k = k.unsqueeze(0)
+            v = v.unsqueeze(0)
+        else:
+            q = q.view(1, -1, self.num_heads, self.head_dim)
+            k = k.view(1, -1, self.num_kv_heads, self.head_dim)
+            v = v.view(1, -1, self.num_kv_heads, self.head_dim)
 
         # Get backend from forward batch
         attn_backend = forward_batch.attn_backend
