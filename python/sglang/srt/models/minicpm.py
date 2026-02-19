@@ -20,13 +20,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-try:
-    import triton
-    import triton.language as tl
-    HAS_TRITON = True
-except ImportError:
-    HAS_TRITON = False
-
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import SimpleGLAAttnBackend
@@ -37,6 +30,7 @@ from sglang.srt.layers.attention.minicpm_sparse_utils import (
     SparseMetadataBuilder,
 )
 from sglang.srt.models.minicpm_fused_norm_rope import fused_rms_norm_rope
+from sglang.srt.models.minicpm_fused_output import fused_output_processing
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -327,32 +321,36 @@ class MiniCPMLightningMixer(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)  # [seq_len, hidden_size] -> [seq_len, q_size+kv_size+kv_size]
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        if self.qk_norm and self.use_rope and HAS_TRITON:
-            # Use fused RMSNorm + RoPE kernel
-            # Get cos_sin_cache from rotary_emb (already in FP32)
-            cos_sin_cache = self.rotary_emb.cos_sin_cache  # [max_position, head_dim * 2]
-            q, k = fused_rms_norm_rope(
-                q=q,
-                k=k,
-                positions=positions,
-                cos_sin_cache=cos_sin_cache,
-                q_norm_weight=self.q_norm.weight,
-                k_norm_weight=self.k_norm.weight,
-                eps=self.rms_norm_eps,
-            )
-        else:
+        if not self.qk_norm or not self.use_rope:
+            pdb.set_trace()
+            print('not qk_norm or not use_rope')
+            pass
+
+        # Use fused RMSNorm + RoPE kernel
+        # Get cos_sin_cache from rotary_emb (already in FP32)
+        cos_sin_cache = self.rotary_emb.cos_sin_cache  # [max_position, head_dim * 2]
+        q, k = fused_rms_norm_rope(
+            q=q,
+            k=k,
+            positions=positions,
+            cos_sin_cache=cos_sin_cache,
+            q_norm_weight=self.q_norm.weight,
+            k_norm_weight=self.k_norm.weight,
+            eps=self.rms_norm_eps,
+        )
+        # else:
         # if True:
             # Fallback to original implementation
-            q = self.q_norm(q.contiguous().view(-1, self.head_dim))
-            k = self.k_norm(k.contiguous().view(-1, self.head_dim))
-            q = q.view(-1, self.num_heads * self.head_dim)
-            k = k.view(-1, self.num_kv_heads * self.head_dim)
+            # q = self.q_norm(q.contiguous().view(-1, self.head_dim))
+            # k = self.k_norm(k.contiguous().view(-1, self.head_dim))
+            # q = q.view(-1, self.num_heads * self.head_dim)
+            # k = k.view(-1, self.num_kv_heads * self.head_dim)
         
-            orig_dtype = q.dtype
-            q, k = q.float(), k.float()
-            q, k = self.rotary_emb(positions, q, k)
-            q = q.to(orig_dtype).view(1, -1, self.num_heads, self.head_dim).contiguous()
-            k = k.to(orig_dtype).view(1, -1, self.num_kv_heads, self.head_dim).contiguous()
+            # orig_dtype = q.dtype
+            # q, k = q.float(), k.float()
+            # q, k = self.rotary_emb(positions, q, k)
+            # q = q.to(orig_dtype).view(1, -1, self.num_heads, self.head_dim).contiguous()
+            # k = k.to(orig_dtype).view(1, -1, self.num_kv_heads, self.head_dim).contiguous()
 
         v = v.reshape(1, -1, self.num_kv_heads, self.head_dim)
 
@@ -383,15 +381,35 @@ class MiniCPMLightningMixer(nn.Module):
             output_attentions=False,
         )
 
-        o = o.reshape(-1, self.num_heads * self.head_dim)
+        if not self.use_output_gate:
+            pdb.set_trace()
+            print('no output gate')
+            pass
+    
+        if not self.use_output_norm:
+            pdb.set_trace()
+            print('no output norm')
+            pass
 
-        if self.use_output_norm:
-            o = self.o_norm(o)
+        z, _ = self.z_proj(hidden_states)   # [seq_len, hidden_size] -> [seq_len, 4096]
 
-        if self.use_output_gate:
-            z, _ = self.z_proj(hidden_states)
-            o = o * F.sigmoid(z)
-
+        # o = o.reshape(-1, self.num_heads * self.head_dim)   # -> [142,4096]
+        # fusing start - use fused kernel
+        o = fused_output_processing(
+            o=o,
+            z=z,
+            norm_weight=self.o_norm.weight,
+            eps=self.rms_norm_eps,
+        )
+        # fusing end
+        # else:
+        # if True:
+            # fusing start
+            # o = self.o_norm(o)  # -> [142,4096]
+            # o = o * F.sigmoid(z)
+            # fusing end
+        # diff = o2 - o1
+        # pdb.set_trace()
         y, _ = self.o_proj(o)
         return y
 
