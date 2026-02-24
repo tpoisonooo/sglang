@@ -955,8 +955,7 @@ class MiniCPMSparseBackend(AttentionBackend):
             topk_idx = self.get_topk_for_sparse(
                 q_reshaped, k, v, q.shape[0], layer, forward_batch
             )
-
-            sparse_page_table_sparse_bs = sparse_kernel_extension.get_block_table_v2(
+            sparse_page_table_sparse_bs = sparse_kernel_extension.get_block_table_prefill(
                 topk_idx,
                 page_table,
                 metadata.token_to_bs,
