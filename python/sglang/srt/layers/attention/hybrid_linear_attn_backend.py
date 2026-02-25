@@ -1606,6 +1606,7 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
         # 52.97s  15.36s  8.67s
         # 51.68s  14.53s  7.98s
         mode = "fused_recurrent" if seq_len < 256 else "chunk"
+        # import pdb; pdb.set_trace()
         if forward_batch.forward_mode.is_decode() or mode == "fused_recurrent":
             o, final_state = fused_recurrent_simple_gla(
                 q=q,

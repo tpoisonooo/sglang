@@ -1764,19 +1764,19 @@ class MiniCPMSparseBackend(AttentionBackend):
                 ][:sparse_bs]
                 kv_last_page_len_view[sparse_real_bs:].fill_(0)
 
-                # Recompute kv_indptr to ensure correct values
-                # kv_indptr should be [0, K, 2K, 3K, ...] where K = num_sparse_topk_tokens
-                # Note: kv_indptr may have been modified by convert_sparse_page_table_to_flashinfer
-                # in the CUDA graph, so we need to restore it to precomputed values
-                K = self.num_sparse_topk_tokens
-                kv_indptr_view.copy_(
-                    torch.arange(0, sparse_bs + 1, dtype=torch.int32, device=self.device) * K
-                )
+                # # Recompute kv_indptr to ensure correct values
+                # # kv_indptr should be [0, K, 2K, 3K, ...] where K = num_sparse_topk_tokens
+                # # Note: kv_indptr may have been modified by convert_sparse_page_table_to_flashinfer
+                # # in the CUDA graph, so we need to restore it to precomputed values
+                # K = self.num_sparse_topk_tokens
+                # kv_indptr_view.copy_(
+                #     torch.arange(0, sparse_bs + 1, dtype=torch.int32, device=self.device) * K
+                # )
 
-                # Ensure kv_indptr is monotonic for unused batch entries
-                # When real_bs < bs, unused entries should have the same value as the last used entry
-                if sparse_real_bs < sparse_bs:
-                    kv_indptr_view[sparse_real_bs + 1:] = kv_indptr_view[sparse_real_bs]
+                # # Ensure kv_indptr is monotonic for unused batch entries
+                # # When real_bs < bs, unused entries should have the same value as the last used entry
+                # if sparse_real_bs < sparse_bs:
+                #     kv_indptr_view[sparse_real_bs + 1:] = kv_indptr_view[sparse_real_bs]
 
                 # Retrieve the wrapper stored during capture
                 wrapper = metadata.decode_wrapper
