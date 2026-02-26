@@ -1,3 +1,5 @@
+import sys
+import os
 import torch
 from sgl_kernel.load_utils import _load_architecture_specific_ops, _preload_cuda_library
 
@@ -9,6 +11,97 @@ if torch.version.cuda is not None:
     _preload_cuda_library()
 
 
+# Debug wrapper for torch.ops.sgl_kernel
+_call_counts = {}
+
+# Global flag to control debug printing
+# Can be set via environment variable SGL_KERNEL_DEBUG=1
+# Or manually: sgl_kernel.set_debug(True)
+_debug_enabled = os.environ.get("SGL_KERNEL_DEBUG", "0") == "1"
+
+
+def set_debug(enabled: bool):
+    """Enable or disable debug printing for sgl_kernel ops.
+    
+    Args:
+        enabled: True to enable debug printing, False to disable
+    
+    Example:
+        import sgl_kernel
+        sgl_kernel.set_debug(True)  # Enable debug printing
+        sgl_kernel.set_debug(False)  # Disable debug printing
+    """
+    global _debug_enabled
+    _debug_enabled = enabled
+    print(f"[sgl_kernel] Debug printing {'enabled' if enabled else 'disabled'}", 
+          file=sys.stderr, flush=True)
+
+
+def is_debug_enabled() -> bool:
+    """Check if debug printing is enabled."""
+    return _debug_enabled
+
+
+def _patch_sgl_kernel_ops():
+    """Patch sgl_kernel ops to add debug prints."""
+    import torch._ops as _ops
+    
+    # Patch OpOverload.__call__ to intercept all op calls
+    original_opoverload_call = _ops.OpOverload.__call__
+    
+    def patched_opoverload_call(self, *args, **kwargs):
+        op_name = str(self)
+        # Only intercept sgl_kernel ops
+        if 'sgl_kernel' in op_name:
+            if _debug_enabled:
+                print(f"[sgl_kernel] {op_name} called", file=sys.stderr, flush=True)
+            _call_counts[op_name] = _call_counts.get(op_name, 0) + 1
+        return original_opoverload_call(self, *args, **kwargs)
+    
+    _ops.OpOverload.__call__ = patched_opoverload_call
+    
+    # Also patch OpOverloadPacket.__call__ for cases where the packet is called directly
+    original_packet_call = _ops.OpOverloadPacket.__call__
+    
+    def patched_packet_call(self, *args, **kwargs):
+        op_name = str(self)
+        if 'sgl_kernel' in op_name:
+            if _debug_enabled:
+                print(f"[sgl_kernel] {op_name} called", file=sys.stderr, flush=True)
+            _call_counts[op_name] = _call_counts.get(op_name, 0) + 1
+        return original_packet_call(self, *args, **kwargs)
+    
+    _ops.OpOverloadPacket.__call__ = patched_packet_call
+
+
+# Apply the patch
+_patch_sgl_kernel_ops()
+
+
+def get_call_counts():
+    """Get the call counts of all sgl_kernel ops."""
+    return _call_counts.copy()
+
+
+def print_call_counts():
+    """Print the call counts of all sgl_kernel ops."""
+    counts = get_call_counts()
+    if counts:
+        print("\n[sgl_kernel] Call counts:", file=sys.stderr, flush=True)
+        for name, count in sorted(counts.items(), key=lambda x: -x[1]):
+            print(f"  {name}: {count}", file=sys.stderr, flush=True)
+    else:
+        print("\n[sgl_kernel] No calls recorded", file=sys.stderr, flush=True)
+
+
+def reset_call_counts():
+    """Reset the call counts."""
+    global _call_counts
+    _call_counts = {}
+    print("[sgl_kernel] Call counts reset", file=sys.stderr, flush=True)
+
+
+# Now import the Python wrappers
 from sgl_kernel.allreduce import *
 from sgl_kernel.attention import (
     cutlass_mla_decode,

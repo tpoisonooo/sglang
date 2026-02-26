@@ -78,6 +78,21 @@ fi
 echo "[2/4] Installing sglang (current directory)..."
 uv pip install "cmake>=3.26"
 uv pip install --upgrade pip setuptools wheel
+
+# Build and install sgl-kernel from source (local changes)
+echo "  - Building sgl-kernel from source..."
+cd "${REPO_ROOT}/sgl-kernel"
+# Force rebuild by cleaning first
+rm -rf build dist *.egg-info _skbuild
+# Install build dependencies first
+uv pip install scikit-build-core torch wheel
+# Set MAX_JOBS for faster compilation (use all CPU cores)
+export MAX_JOBS=8
+echo "    Using MAX_JOBS=${MAX_JOBS} for compilation"
+uv pip install -e . --no-build-isolation
+
+# Install sglang
+cd "${REPO_ROOT}"
 uv pip install -e "${REPO_ROOT}/python[all]"
 
 # Build and install CUDA kernel dependencies
