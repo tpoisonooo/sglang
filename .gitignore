@@ -263,3 +263,4 @@ outputs/
 python/sglang/_version.py
 
 sgl-kernel/csrc/elementwise/test/
+sgl-kernel/csrc/test_rmsnorm/

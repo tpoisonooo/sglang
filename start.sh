@@ -17,6 +17,7 @@ python -m sglang.bench_one_batch --model-path /data/share/MiniCPM-SALA  \
 docker run --rm -it   --gpus "device=4"  \
     --privileged --runtime=nvidia -p 30000:30000 \
     -v /data/share/MiniCPM-SALA:/models/MiniCPM-SALA:ro \
+    -v /home/khj/workspace/sglang:/source/sglang \
     --entrypoint=/bin/bash \
     modelbest-registry.cn-beijing.cr.aliyuncs.com/public/soar-toolkit:latest
 
@@ -54,6 +55,8 @@ docker run --name sglang-server \
   modelbest-registry.cn-beijing.cr.aliyuncs.com/public/soar-toolkit:latest 
 
 
+/home/khj/workspace/sglang
+
 # 测速度
 export SPEED_DATA_S1=/home/khj/workspace/sglang/speech.jsonl
 export SPEED_DATA_S8=/home/khj/workspace/sglang/speech.jsonl
@@ -69,12 +72,12 @@ python3 eval_model.py \
 
 
 # 测试代码
-python -m sglang.bench_one_batch --model-path /data/share/MiniCPM-SALA   \
+SGL_KERNEL_DEBUG=1 python -m sglang.bench_one_batch --model-path /data/share/MiniCPM-SALA   \
    --batch 4 --input-len 1024 --output-len 512  \
    --trust-remote-code     --disable-radix-cache   \
    --attention-backend minicpm_flashinfer  \
    --chunked-prefill-size 8192 --skip-server-warmup --dense-as-sparse  \
-   --tp-size 1
+   --tp-size 1 2>&1 >> profile.out
 
 [2026-02-26 10:25:20 TP0] Reset HybridReqToTokenPool
 Prefill. latency: 0.46342 s, throughput:   9316.59 token/s
@@ -95,3 +98,8 @@ Decode 3. Batch size: 4, latency: 0.01187 s, throughput:    337.09 token/s
 Decode 4. Batch size: 4, latency: 0.01184 s, throughput:    337.83 token/s
 Decode.  median latency: 0.01175 s, median throughput:    340.47 token/s
 Total. latency:  6.395 s, throughput:    960.75 token/s
+
+
+# 提交
+uv build --sdist --no-build-isolation 
+

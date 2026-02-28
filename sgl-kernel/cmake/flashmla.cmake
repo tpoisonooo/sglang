@@ -20,12 +20,12 @@ set(FLASHMLA_CUDA_FLAGS
 # The FlashMLA kernels only work on hopper and require CUDA 12.4 or later.
 # Only build FlashMLA kernels if we are building for something compatible with
 # sm90a
-if(${CUDA_VERSION} VERSION_GREATER 12.4)
+if(CUDA_VERSION VERSION_GREATER_EQUAL 12.4)
     list(APPEND FLASHMLA_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
     )
 endif()
-if(${CUDA_VERSION} VERSION_GREATER 12.8)
+if(CUDA_VERSION VERSION_GREATER_EQUAL 12.8)
     list(APPEND FLASHMLA_CUDA_FLAGS
         "-gencode=arch=compute_100a,code=sm_100a"
     )

@@ -64,7 +64,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    * From csrc/elementwise
    */
   m.def("rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()");
-  m.impl("rmsnorm", torch::kCUDA, &rmsnorm);
+  m.impl("rmsnorm", torch::kCUDA, &sgl_rmsnorm);  // Use optimized implementation
 
   m.def("fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool enable_pdl) -> ()");
   m.impl("fused_add_rmsnorm", torch::kCUDA, &sgl_fused_add_rmsnorm);
