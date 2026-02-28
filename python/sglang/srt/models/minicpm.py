@@ -321,7 +321,8 @@ class MiniCPMLightningMixer(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
 
-        if self.qk_norm and self.use_rope:
+        # if self.qk_norm and self.use_rope:
+        if False:
             cos_sin_cache = self.rotary_emb.cos_sin_cache  # [max_position, head_dim * 2]
             # print(f'fused_rms_rope shape {q.shape}, {k.shape}, {self.num_heads}, {self.head_dim}')
             q, k = fused_rms_norm_rope(
@@ -386,8 +387,7 @@ class MiniCPMLightningMixer(nn.Module):
             output_attentions=False,
         )
 		
-        # if self.use_output_gate and self.use_output_norm:
-        if False:
+        if self.use_output_gate and self.use_output_norm:
             z, _ = self.z_proj(hidden_states)   # [seq_len, hidden_size] -> [seq_len, 4096]
             o = fused_output_processing(
                 o=o,
