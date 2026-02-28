@@ -1,4 +1,4 @@
-ARG BASE_IMG=pytorch/manylinux2_28-builder
+ARG BASE_IMG=localhost:5000/manylinux
 ARG CUDA_VERSION=12.9
 
 # Dependency stage: install system deps, CMake, ccache, Python deps (including torch)
@@ -18,6 +18,14 @@ ARG CCACHE_VERSION=4.12.1
 ARG GITHUB_ARTIFACTORY=github.com
 ARG PYTORCH_MIRROR=download.pytorch.org
 ARG PIP_DEFAULT_INDEX=https://pypi.python.org/simple
+
+# Proxy settings
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ENV http_proxy=${http_proxy}
+ENV https_proxy=${https_proxy}
+ENV no_proxy=${no_proxy}
 
 ENV PYTHON_ROOT_PATH=/opt/python/${PYTHON_TAG}
 ENV PATH=/opt/cmake/bin:${PATH}

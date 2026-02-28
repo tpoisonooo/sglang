@@ -35,7 +35,7 @@ KERNEL_CONFIGS = {
     128: (128, 4, 3),  # head_dim=128: 128 threads, 4 warps, 3 stages
 }
 
-
+# num_heads 固定 32； head_dim 固定 128。这是个特化的算子，不兼容。
 @triton.jit
 def fused_rms_norm_rope_kernel(
     # Input pointers

@@ -746,10 +746,10 @@ void top_p_sampling_from_probs(
 void top_k_mask_logits(
     at::Tensor logits, at::Tensor mask_logits, std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val);
 
-namespace flash {
 /*
  * From fa2 sparse
  */
+namespace flash {
 std::vector<at::Tensor> mha_fwd_sparse(
     at::Tensor& q,        // batch_size x seqlen_q x num_heads x head_size
     const at::Tensor& k,  // batch_size x seqlen_k x num_heads_k x head_size

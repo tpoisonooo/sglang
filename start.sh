@@ -13,25 +13,6 @@ python -m sglang.bench_one_batch --model-path /data/share/MiniCPM-SALA  \
     --chunked-prefill-size 8192 --skip-server-warmup --dense-as-sparse \
     --tp-size 1
 
-# 先进 docker 再启动
-docker run --rm -it   --gpus "device=4"  \
-    --privileged --runtime=nvidia -p 30000:30000 \
-    -v /data/share/MiniCPM-SALA:/models/MiniCPM-SALA:ro \
-    -v /home/khj/workspace/sglang:/source/sglang \
-    --entrypoint=/bin/bash \
-    modelbest-registry.cn-beijing.cr.aliyuncs.com/public/soar-toolkit:latest
-
-python3 -m sglang.launch_server \
-    --model /models/MiniCPM-SALA \
-    --host "0.0.0.0"  \
-    --trust-remote-code \
-    --port 30000 \
-    --disable-radix-cache \
-    --attention-backend minicpm_flashinfer \
-    --chunked-prefill-size 32768 --skip-server-warmup --dense-as-sparse \
-    --max-running-requests 32 \
-    --tp-size 1
-
 python3 -m sglang.launch_server \
     --model /data/share/MiniCPM-SALA \
     --host "0.0.0.0"  \
@@ -99,7 +80,60 @@ Decode 4. Batch size: 4, latency: 0.01184 s, throughput:    337.83 token/s
 Decode.  median latency: 0.01175 s, median throughput:    340.47 token/s
 Total. latency:  6.395 s, throughput:    960.75 token/s
 
+# 编译
+rm -rf ~/.cache/sgl-kernel/
+rm -rf dist/sgl_kernel-0.3.20-cp310-abi3-many*
+USE_LOCAL_DOCKER_IMAGES=1 ./build_local.sh "3.12" "12.9"
 
-# 提交
+# 旧版提交
 uv build --sdist --no-build-isolation 
 
+# 新版试运行
+# 先进 docker
+docker run --rm -it   --gpus "device=0"  \
+    --privileged --runtime=nvidia -p 30000:30000 \
+    -v /data/share/MiniCPM-SALA:/models/MiniCPM-SALA:ro \
+    -v /home/khj/workspace/sglang:/source/sglang \
+    --entrypoint=/bin/bash \
+    modelbest-registry.cn-beijing.cr.aliyuncs.com/public/soar-toolkit:latest
+
+docker run --rm -it   --gpus "device=6"  \
+    --runtime=nvidia -p 30000:30000 \
+    -v /data/share/MiniCPM-SALA:/models/MiniCPM-SALA:ro \
+    -v /home/khj/workspace/sglang:/source/sglang \
+    --entrypoint=/bin/bash \
+    modelbest-registry.cn-beijing.cr.aliyuncs.com/public/soar-toolkit:latest
+
+source /opt/SGLang-MiniCPM-SALA/sglang_minicpm_sala_env/bin/activate
+uv pip install --no-deps -e /source/sglang/python
+
+python3 -m sglang.launch_server \
+    --model /models/MiniCPM-SALA \
+    --host "0.0.0.0"  \
+    --trust-remote-code \
+    --port 30000 \
+    --disable-radix-cache \
+    --attention-backend minicpm_flashinfer \
+    --chunked-prefill-size 32768 --skip-server-warmup --dense-as-sparse \
+    --max-running-requests 32 \
+    --tp-size 1
+
+export CUDA_VISIBLE_DEVICES="0"
+python -m sglang.bench_one_batch --model-path /models/MiniCPM-SALA  \
+    --batch 8 --input-len 256 --output-len 32 \
+    --trust-remote-code \
+    --disable-radix-cache \
+    --attention-backend minicpm_flashinfer \
+    --chunked-prefill-size 8192 --skip-server-warmup --dense-as-sparse \
+    --tp-size 1
+
+# 原始数据 3970 @ sgl-kernel @ 0.3.20
+# 原始数据 3961 @ sgl-kernel @ 0.3.21
+
+python -m sglang.bench_one_batch --model-path /data/share/MiniCPM-SALA  \
+    --batch 8 --input-len 256 --output-len 32 \
+    --trust-remote-code \
+    --disable-radix-cache \
+    --attention-backend minicpm_flashinfer \
+    --chunked-prefill-size 8192 --skip-server-warmup --dense-as-sparse \
+    --tp-size 1
