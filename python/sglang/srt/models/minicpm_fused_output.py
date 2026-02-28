@@ -111,21 +111,25 @@ def _get_launch_config(hidden_size: int):
     """Get kernel launch configuration based on hidden_size.
     
     Returns (BLOCK_SIZE, num_warps, num_stages)
+    
+    Note: Configurations adjusted for Blackwell consumer GPUs (RTX 6000D).
+    Original values were optimized for H800 Hopper datacenter GPU with many SMs.
+    Reduced block sizes and num_warps to improve occupancy on consumer GPUs.
     """
     if hidden_size <= 512:
         # Small hidden_size: process in one block
         BLOCK_SIZE = max(128, _next_power_of_2(hidden_size))
-        num_warps = min(BLOCK_SIZE // 32, 8)
+        num_warps = min(BLOCK_SIZE // 32, 4)  # Reduced max warps from 8 to 4
         num_stages = 3
     elif hidden_size <= 2048:
         # Medium hidden_size: process in one block
         BLOCK_SIZE = _next_power_of_2(hidden_size)
-        num_warps = min(BLOCK_SIZE // 32, 8)
+        num_warps = min(BLOCK_SIZE // 32, 4)  # Reduced max warps from 8 to 4
         num_stages = 3
     else:
-        # Large hidden_size: use 2048 threads
-        BLOCK_SIZE = 2048
-        num_warps = 8
+        # Large hidden_size: use 1024 threads (reduced from 2048 for Blackwell)
+        BLOCK_SIZE = 1024
+        num_warps = 4  # Reduced from 8 to 4 for better occupancy on consumer GPUs
         num_stages = 2
     
     return BLOCK_SIZE, num_warps, num_stages

@@ -86,17 +86,20 @@ def _fused_scale_add_ultra_kernel(
     """Ultra-optimized kernel: 16x vectorization, one block per row.
     
     Optimization techniques:
-    - 16x vectorization (256 threads * 16 = 4096 elements per row)
+    - 16x vectorization (128 threads * 32 = 4096 elements per row)
     - Perfect memory coalescing (consecutive threads access consecutive addresses)
     - FP32 accumulation for numerical stability
     - Static loop unrolling via tl.static_range
     
     Best for: seq_len >= 1024, HIDDEN_DIM = 4096
+    
+    Note: Reduced BLOCK_SIZE from 256 to 128 for Blackwell consumer GPUs (RTX 6000D)
+    to improve occupancy on GPUs with fewer SMs compared to H800.
     """
     pid = tl.program_id(axis=0)
     
-    BLOCK_SIZE: tl.constexpr = 256
-    UNROLL: tl.constexpr = 16
+    BLOCK_SIZE: tl.constexpr = 128
+    UNROLL: tl.constexpr = 32
     
     base = pid * HIDDEN_DIM
     offsets = tl.arange(0, BLOCK_SIZE)
@@ -130,27 +133,30 @@ def _fused_scale_add_pipeline_kernel(
     - Reduces memory latency stalls
     
     Best for: Large seq_len where memory latency matters
+    
+    Note: Reduced thread count from 256 to 128 for Blackwell consumer GPUs (RTX 6000D)
+    to improve occupancy on GPUs with fewer SMs compared to H800.
     """
     pid = tl.program_id(axis=0)
     
     row_off = pid * HIDDEN_DIM
-    tid = tl.arange(0, 256)
+    tid = tl.arange(0, 128)
     
     # Prefetch first
     x_prev = tl.load(input_ptr + row_off + tid).to(tl.float32)
     r_prev = tl.load(residual_ptr + row_off + tid).to(tl.float32)
     
-    for i in tl.static_range(1, 16):
+    for i in tl.static_range(1, 32):
         # Compute previous
         result_prev = r_prev + x_prev * scale
         
         # Load next (overlaps with previous compute)
-        idx_next = i * 256 + tid
+        idx_next = i * 128 + tid
         x_next = tl.load(input_ptr + row_off + idx_next).to(tl.float32)
         r_next = tl.load(residual_ptr + row_off + idx_next).to(tl.float32)
         
         # Store previous result
-        tl.store(output_ptr + row_off + (i - 1) * 256 + tid, result_prev.to(tl.bfloat16))
+        tl.store(output_ptr + row_off + (i - 1) * 128 + tid, result_prev.to(tl.bfloat16))
         
         # Move next to previous
         x_prev = x_next
@@ -158,7 +164,7 @@ def _fused_scale_add_pipeline_kernel(
     
     # Final store
     result_prev = r_prev + x_prev * scale
-    tl.store(output_ptr + row_off + 15 * 256 + tid, result_prev.to(tl.bfloat16))
+    tl.store(output_ptr + row_off + 31 * 128 + tid, result_prev.to(tl.bfloat16))
 
 
 @triton.jit
@@ -187,15 +193,16 @@ def _fused_scale_add_persistent_kernel(
     rows_per_grid = num_blocks * ROWS_PER_BLOCK
     
     # Grid-stride loop
+    # Note: Reduced thread count from 256 to 128 for Blackwell consumer GPUs (RTX 6000D)
     for row_base in range(pid * ROWS_PER_BLOCK, total_rows, rows_per_grid):
         for row_idx in tl.static_range(ROWS_PER_BLOCK):
             row = row_base + row_idx
             if row < total_rows:
                 row_off = row * HIDDEN_DIM
-                tid = tl.arange(0, 256)
+                tid = tl.arange(0, 128)
                 
-                for i in tl.static_range(16):
-                    idx = i * 256 + tid
+                for i in tl.static_range(32):
+                    idx = i * 128 + tid
                     off = row_off + idx
                     
                     x = tl.load(input_ptr + off).to(tl.float32)
@@ -212,18 +219,19 @@ def _fused_scale_add_persistent_kernel(
 fused_scale_add_autotune = triton.autotune(
     configs=[
         # Small seq_len: minimize launch overhead
+        # Reduced num_warps for Blackwell consumer GPUs (RTX 6000D)
+        triton.Config(kwargs={}, num_warps=2, num_stages=1),
         triton.Config(kwargs={}, num_warps=4, num_stages=1),
-        triton.Config(kwargs={}, num_warps=8, num_stages=1),
         
         # Medium seq_len: balance
+        triton.Config(kwargs={}, num_warps=2, num_stages=2),
         triton.Config(kwargs={}, num_warps=4, num_stages=2),
         triton.Config(kwargs={}, num_warps=8, num_stages=2),
-        triton.Config(kwargs={}, num_warps=16, num_stages=2),
         
         # Large seq_len: maximize memory bandwidth
+        triton.Config(kwargs={}, num_warps=4, num_stages=4),
         triton.Config(kwargs={}, num_warps=8, num_stages=4),
         triton.Config(kwargs={}, num_warps=16, num_stages=4),
-        triton.Config(kwargs={}, num_warps=32, num_stages=4),
     ],
     key=["seq_len"],
 )
@@ -238,14 +246,18 @@ def _fused_scale_add_autotuned_kernel(
     seq_len: tl.constexpr,
     HIDDEN_DIM: tl.constexpr = 4096,
 ):
-    """Autotuned kernel - best configuration selected at runtime."""
+    """Autotuned kernel - best configuration selected at runtime.
+    
+    Note: Reduced thread count from 256 to 128 for Blackwell consumer GPUs (RTX 6000D)
+    to improve occupancy on GPUs with fewer SMs compared to H800.
+    """
     pid = tl.program_id(axis=0)
     
-    tid = tl.arange(0, 256)
+    tid = tl.arange(0, 128)
     row_off = pid * HIDDEN_DIM
     
-    for i in tl.static_range(16):
-        idx = i * 256 + tid
+    for i in tl.static_range(32):
+        idx = i * 128 + tid
         off = row_off + idx
         
         x = tl.load(input_ptr + off).to(tl.float32)
@@ -272,7 +284,9 @@ def fused_scale_add_basic(
     assert hidden_dim == 4096, f"Expected hidden_dim=4096, got {hidden_dim}"
     
     n_elements = seq_len * hidden_dim
-    BLOCK_SIZE = 1024
+    # Reduced BLOCK_SIZE for Blackwell consumer GPUs (RTX 6000D)
+    # Original 1024 was optimized for H800 Hopper datacenter GPU
+    BLOCK_SIZE = 512
     
     _fused_scale_add_basic_kernel[(triton.cdiv(n_elements, BLOCK_SIZE),)](
         input_tensor, residual, output, scale, n_elements, BLOCK_SIZE=BLOCK_SIZE,
@@ -293,7 +307,7 @@ def fused_scale_add_ultra(
     grid = (seq_len,)
     _fused_scale_add_ultra_kernel[grid](
         input_tensor, residual, output, scale, seq_len=seq_len,
-        num_warps=8, num_stages=2,
+        num_warps=4, num_stages=2,  # Reduced num_warps from 8 to 4 for Blackwell
     )
     return output
 
@@ -311,7 +325,7 @@ def fused_scale_add_pipeline(
     grid = (seq_len,)
     _fused_scale_add_pipeline_kernel[grid](
         input_tensor, residual, output, scale, seq_len=seq_len,
-        num_warps=8, num_stages=4,
+        num_warps=4, num_stages=4,  # Reduced num_warps from 8 to 4 for Blackwell
     )
     return output
 
@@ -332,7 +346,7 @@ def fused_scale_add_persistent(
     
     _fused_scale_add_persistent_kernel[(grid_size,)](
         input_tensor, residual, output, scale, seq_len=seq_len,
-        ROWS_PER_BLOCK=rows_per_block, num_warps=8, num_stages=2,
+        ROWS_PER_BLOCK=rows_per_block, num_warps=4, num_stages=2,  # Reduced num_warps from 8 to 4 for Blackwell
     )
     return output
 
@@ -415,12 +429,12 @@ def fused_scale_add(
     # - Small seq_len: PyTorch has lower overhead
     # - Medium seq_len: ultra version is well-balanced
     # - Large seq_len: basic version has best memory bandwidth
-    # if seq_len <= 512:
-    #     return residual + input_tensor * scale
-    # elif seq_len <= 2048:
-    #     return fused_scale_add_ultra(input_tensor, residual, scale)
-    # else:
-    return fused_scale_add_basic(input_tensor, residual, scale)
+    if seq_len <= 512:
+        return residual + input_tensor * scale
+    elif seq_len <= 2048:
+        return fused_scale_add_ultra(input_tensor, residual, scale)
+    else:
+        return fused_scale_add_basic(input_tensor, residual, scale)
 
 # Backward compatibility
 def fused_scale_add_default(
