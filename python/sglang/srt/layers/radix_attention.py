@@ -43,6 +43,7 @@ class AttentionType(Enum):
 class RadixAttention(nn.Module):
     """
     The attention layer implementation.
+    构造 Radix 树实现前缀优化
     """
 
     def __init__(

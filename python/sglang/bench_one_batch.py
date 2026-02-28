@@ -178,6 +178,8 @@ class BenchArgs:
     profile_activities: Tuple[str] = ("CPU", "GPU")
     profile_stage: str = "all"
     profile_filename_prefix: str = "profile"
+    # Batch merging for small batches to improve GPU occupancy
+    merge_small_batches_threshold: int = None  # Minimum total tokens to trigger merging
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -233,11 +235,26 @@ class BenchArgs:
             help="Prefix of the profiling file names. The full profiling result file(s) be "
             '"[profile_filename_prefix]_batch[batch_size]_input[input_len]_output[output_len].trace.json.gz"',
         )
+        parser.add_argument(
+            "--merge-small-batches-threshold",
+            type=int,
+            default=BenchArgs.merge_small_batches_threshold,
+            help="Minimum total token count to trigger batch merging. "
+            "If batch_size * input_len < threshold, multiple sequences will be "
+            "merged into one long sequence to improve GPU occupancy. "
+            "Only applies to prefill phase. Disabled by default.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         # use the default value's type to cast the args into correct types.
-        attrs = [(attr.name, type(attr.default)) for attr in dataclasses.fields(cls)]
+        def get_attr_type(attr):
+            # Handle None defaults - use the type of the actual value from args
+            if attr.default is None:
+                return lambda x: x
+            return type(attr.default)
+        
+        attrs = [(attr.name, get_attr_type(attr)) for attr in dataclasses.fields(cls)]
         return cls(
             **{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs}
         )
@@ -323,8 +340,22 @@ def prepare_extend_inputs_for_correctness_test(
 
 
 def prepare_synthetic_inputs_for_latency_test(
-    batch_size, input_len, custom_inputs=None
+    batch_size, input_len, custom_inputs=None, merge_small_batches_threshold=None
 ):
+    """
+    Prepare synthetic input requests for latency testing.
+    
+    Args:
+        batch_size: Number of sequences in the batch
+        input_len: Length of each input sequence
+        custom_inputs: Optional custom input ids to use instead of random
+        merge_small_batches_threshold: If set, merge small batches into larger ones
+            to improve GPU occupancy. The value is the minimum total token count
+            to trigger merging. For example, if batch_size=2, input_len=256, 
+            total_tokens=512, and merge_small_batches_threshold=1024, then the
+            two sequences will be merged into one sequence of length 512.
+            Note: This is only for benchmarking prefill throughput with small batches.
+    """
     input_ids = (
         custom_inputs
         if custom_inputs
@@ -334,6 +365,39 @@ def prepare_synthetic_inputs_for_latency_test(
         temperature=0,
         max_new_tokens=BenchArgs.output_len,
     )
+
+    # Check if we should merge batches
+    total_tokens = batch_size * input_len
+    should_merge = (
+        merge_small_batches_threshold is not None 
+        and total_tokens < merge_small_batches_threshold
+        and batch_size > 1
+    )
+
+    # import pdb; pdb.set_trace()
+
+    if should_merge:
+        # Merge all input_ids into a single long sequence
+        merged_input_ids = np.concatenate(input_ids).tolist()
+        print(
+            f"[Batch Merge] Merging {batch_size} sequences of length {input_len} "
+            f"into 1 sequence of length {len(merged_input_ids)} "
+            f"(threshold: {merge_small_batches_threshold})"
+        )
+        req = Req(
+            rid=0,
+            origin_input_text="",
+            origin_input_ids=merged_input_ids,
+            sampling_params=sampling_params,
+        )
+        req.fill_ids = req.origin_input_ids
+        req.logprob_start_len = -1
+        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+        # Mark this as a merged request for debugging
+        req._is_merged_batch = True
+        req._original_batch_size = batch_size
+        req._original_input_len = input_len
+        return [req]
 
     reqs = []
     for i in range(len(input_ids)):
@@ -488,6 +552,9 @@ def correctness_test(
     for i in range(len(reqs)):
         rank_print(f"========== Prompt {i} ==========")
         rank_print(tokenizer.decode(output_ids[i]), "\n")
+
+    # Always destroy distributed environment if it was initialized
+    destroy_distributed_environment()
 
 
 def synchronize(device):
@@ -649,7 +716,8 @@ def latency_test(
 
     # Prepare inputs for warm up
     reqs = prepare_synthetic_inputs_for_latency_test(
-        bench_args.batch_size[0], bench_args.input_len[0]
+        bench_args.batch_size[0], bench_args.input_len[0],
+        merge_small_batches_threshold=bench_args.merge_small_batches_threshold
     )
 
     # Warm up
@@ -703,7 +771,10 @@ def latency_test(
                     [bs_aligned_inputs[-1]] * (bs - custom_input_len)
                 )
 
-        reqs = prepare_synthetic_inputs_for_latency_test(bs, il, bs_aligned_inputs)
+        reqs = prepare_synthetic_inputs_for_latency_test(
+            bs, il, bs_aligned_inputs,
+            merge_small_batches_threshold=bench_args.merge_small_batches_threshold
+        )
         ret = latency_test_run_once(
             bench_args.run_name,
             model_runner,
@@ -730,8 +801,8 @@ def latency_test(
             for result in result_list:
                 fout.write(json.dumps(result) + "\n")
 
-    if server_args.tp_size > 1:
-        destroy_distributed_environment()
+    # Always destroy distributed environment if it was initialized
+    destroy_distributed_environment()
 
 
 def main(server_args, bench_args):
@@ -774,7 +845,10 @@ def main(server_args, bench_args):
         for proc in workers:
             proc.join()
 
-        proc.terminate()
+        for proc in workers:
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=1)
 
 
 if __name__ == "__main__":

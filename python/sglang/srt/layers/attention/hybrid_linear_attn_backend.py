@@ -1562,31 +1562,51 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
 
         num_heads = q.shape[2]
         head_dim = q.shape[3]
-        if forward_batch.forward_mode.is_decode():
-            seq_len = 1
-        else:
-            seq_len = torch.max(forward_batch.extend_seq_lens)
+        is_decode = forward_batch.forward_mode.is_decode()
+        seq_len = 1 if is_decode else torch.max(forward_batch.extend_seq_lens)
 
         mamba_indices = self._get_mamba_indices(forward_batch)
         initial_state = None
-        has_initial_state = forward_batch.extend_prefix_lens is not None and forward_batch.extend_prefix_lens > 0
-        if forward_batch.forward_mode.is_decode() or has_initial_state.any():
-            cache_idx = self.req_to_token_pool.mamba_map.get(layer_id)
-            if cache_idx is not None:
-                layer_cache = self.req_to_token_pool.mamba_pool.mamba2_layer_cache(cache_idx)
-                initial_state = layer_cache.temporal[mamba_indices, :].contiguous()
-            else:
-                raise RuntimeError(
-                    f"SimpleGLAAttnBackend layer {layer_id} is missing from mamba_map. "
-                    f"This indicates a misconfiguration - lightning layers must be registered in cache_params.layers. "
-                    f"Available layers: {list(self.req_to_token_pool.mamba_map.keys())}"
-                )
+        
+        # has_initial_state = forward_batch.extend_prefix_lens is not None and forward_batch.extend_prefix_lens > 0
+        prefix_lens = forward_batch.extend_prefix_lens
+        if prefix_lens is None:
+            has_initial_state = False
+        else:
+            has_initial_state = (prefix_lens > 0).any() if isinstance(prefix_lens, torch.Tensor) else prefix_lens > 0
+
+        pool = self.req_to_token_pool
+        mamba_map = pool.mamba_map
+        mamba_pool = pool.mamba_pool
+        cache_idx = mamba_map.get(layer_id)
+        layer_cache = mamba_pool.mamba2_layer_cache(cache_idx)
+
+        if forward_batch.forward_mode.is_decode() or has_initial_state:
+            # if cache_idx is not None:
+            initial_state = layer_cache.temporal[mamba_indices, :].contiguous()
+            # else:
+            #     raise RuntimeError(
+            #         f"SimpleGLAAttnBackend layer {layer_id} is missing from mamba_map. "
+            #         f"This indicates a misconfiguration - lightning layers must be registered in cache_params.layers. "
+            #         f"Available layers: {list(mamba_map.keys())}"
+            #     )
 
         scale = self.scale
-
         g_gamma = self.g_gamma
 
-        mode = "fused_recurrent" if seq_len < 64 else "chunk"
+        # 53.27s   15.40s  8.64s
+        # 52.13s    15.07s   8.75s
+        
+        # 53.01s   15.10s  8.65s
+        # 50.11s  14.71s  8.51s
+
+        # 53.30s  15.14s   8.61s
+        # 52.22s  14.60s  8.56s
+
+        # 52.97s  15.36s  8.67s
+        # 51.68s  14.53s  7.98s
+        mode = "fused_recurrent" if seq_len < 256 else "chunk"
+        # import pdb; pdb.set_trace()
         if forward_batch.forward_mode.is_decode() or mode == "fused_recurrent":
             o, final_state = fused_recurrent_simple_gla(
                 q=q,
@@ -1610,19 +1630,23 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
                 cu_seqlens=self.forward_metadata.query_start_loc,
             )
 
-        if final_state is not None:
-            mamba_indices = self._get_mamba_indices(forward_batch)
-            cache_idx = self.req_to_token_pool.mamba_map.get(layer_id)
+        # if final_state is not None:
+        # mamba_indices = self._get_mamba_indices(forward_batch)
+        # cache_idx = mamba_map.get(layer_id)
 
-            if cache_idx is not None:
-                layer_cache = self.req_to_token_pool.mamba_pool.mamba2_layer_cache(cache_idx)
-                layer_cache.temporal[mamba_indices, :] = final_state
-            else:
-                raise RuntimeError(
-                    f"SimpleGLAAttnBackend layer {layer_id} is missing from mamba_map. "
-                    f"Cannot save state - layer must be registered in cache_params.layers. "
-                    f"Available layers: {list(self.req_to_token_pool.mamba_map.keys())}"
-                )
+        # if cache_idx is not None:
+        # layer_cache = mamba_pool.mamba2_layer_cache(cache_idx)
+        layer_cache.temporal[mamba_indices, :] = final_state
+        # else:
+        #     import pdb; pdb.set_trace()
+        #     raise RuntimeError(
+        #         f"SimpleGLAAttnBackend layer {layer_id} is missing from mamba_map. "
+        #         f"Cannot save state - layer must be registered in cache_params.layers. "
+        #         f"Available layers: {list(mamba_map.keys())}"
+        #     )
+        # else:
+        #     import pdb; pdb.set_trace()
+        #     pass
 
         o = o.reshape(-1, num_heads * head_dim)
 
