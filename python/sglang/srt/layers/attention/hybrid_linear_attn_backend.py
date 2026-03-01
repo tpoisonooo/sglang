@@ -32,14 +32,13 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
     Mamba2Metadata,
 )
-
-# Import Simple GLA from fla if available
-try:
-    from fla.ops.simple_gla import chunk_simple_gla
-    from fla.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla
-    SIMPLE_GLA_AVAILABLE = True
-except ImportError:
-    SIMPLE_GLA_AVAILABLE = False
+# Use optimized local implementation for fused_recurrent_simple_gla
+from sglang.srt.layers.attention.minicpm_recurrent_simple_gla import (
+    fused_recurrent_simple_gla,
+)
+from sglang.srt.layers.attention.minicpm_chunk_gla import (
+    chunk_simple_gla,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -1478,11 +1477,8 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
         else:
             self.scale = 1.0
 
-        if not SIMPLE_GLA_AVAILABLE:
-            raise ImportError(
-                "Simple GLA backend requested but the 'fla' package is not installed. "
-                "Install it or configure the model to use a supported attention backend (e.g., Mamba2)."
-            )
+        # Note: Both fused_recurrent_simple_gla and chunk_simple_gla are now
+        # using local optimized implementations, no need to check for fla package
 
     def _get_mamba_indices(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Get mamba cache indices with fallback logic.
@@ -1604,9 +1600,11 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
 
         # 52.97s  15.36s  8.67s
         # 51.68s  14.53s  7.98s
-        mode = "fused_recurrent" if seq_len < 64 else "chunk"
+        mode = "fused_recurrent" if seq_len < 128 else "chunk"
         # import pdb; pdb.set_trace()
         if forward_batch.forward_mode.is_decode() or mode == "fused_recurrent":
+            # print(f' fuse_rec_simple_gla {q.shape}, {k.shape}, {v.shape}, {g_gamma.shape}')
+            # torch.Size([batch, seq_len, 32, 128]), torch.Size([batch, seq_len, 32, 128]), torch.Size([batch, seq_len, 32, 128]), torch.Size([32])
             o, final_state = fused_recurrent_simple_gla(
                 q=q,
                 k=k,
@@ -1614,17 +1612,17 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
                 g_gamma=g_gamma,
                 scale=scale,
                 initial_state=initial_state,
-                output_final_state=True,
                 cu_seqlens=self.forward_metadata.query_start_loc,
             )
         else:
+            # print(f' chunk_simple_gla {q.shape}, {k.shape}, {v.shape}, {g_gamma.shape}')
+            # torch.Size([batch, seq_len, 32, 128]), torch.Size([batch, seq_len, 32, 128]), torch.Size([batch, seq_len, 32, 128]), torch.Size([32])
             o, final_state = chunk_simple_gla(
                 q=q,
                 k=k,
                 v=v,
                 g_gamma=g_gamma,
                 initial_state=initial_state,
-                output_final_state=True,
                 scale=scale,
                 cu_seqlens=self.forward_metadata.query_start_loc,
             )
