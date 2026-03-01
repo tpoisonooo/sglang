@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 """Inference-only MiniCPM model compatible with HuggingFace weights."""
-import pdb
 import math
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -322,41 +321,41 @@ class MiniCPMLightningMixer(nn.Module):
 
         # print(f'fused_rms_rope shape {q.shape}, {k.shape}, {self.num_heads}, {self.head_dim}, {self.num_kv_heads}')
 
-        if self.qk_norm and self.use_rope:
-            q, k = fused_rms_norm_rope(
-                q=q,
-                k=k,
-                positions=positions,
-                q_norm_weight=self.q_norm.weight,
-                k_norm_weight=self.k_norm.weight,
-                cos_sin_cache=self.rotary_emb.cos_sin_cache, # [max_position, head_dim * 2]
-                eps=self.rms_norm_eps,
-            )
+        # if self.qk_norm and self.use_rope:
+        q, k = fused_rms_norm_rope(
+            q=q,
+            k=k,
+            positions=positions,
+            q_norm_weight=self.q_norm.weight,
+            k_norm_weight=self.k_norm.weight,
+            cos_sin_cache=self.rotary_emb.cos_sin_cache, # [max_position, head_dim * 2]
+            eps=self.rms_norm_eps,
+        )
 
-            v = v.reshape(1, -1, self.num_kv_heads, self.head_dim)
-        else:
-            # ground truth start
-            if self.qk_norm:
-                q = self.q_norm(q.reshape(-1, self.head_dim))
-                k = self.k_norm(k.reshape(-1, self.head_dim))
+        v = v.reshape(1, -1, self.num_kv_heads, self.head_dim)
+        # else:
+        #     # ground truth start
+        #     if self.qk_norm:
+        #         q = self.q_norm(q.reshape(-1, self.head_dim))
+        #         k = self.k_norm(k.reshape(-1, self.head_dim))
 
-            if self.use_rope:
-                q = q.reshape(-1, self.num_heads * self.head_dim)
-                k = k.reshape(-1, self.num_kv_heads * self.head_dim)
-                orig_dtype = q.dtype
-                q, k = q.float(), k.float()
-                q, k = self.rotary_emb(positions, q, k)
-                q, k = q.to(orig_dtype), k.to(orig_dtype)
+        #     if self.use_rope:
+        #         q = q.reshape(-1, self.num_heads * self.head_dim)
+        #         k = k.reshape(-1, self.num_kv_heads * self.head_dim)
+        #         orig_dtype = q.dtype
+        #         q, k = q.float(), k.float()
+        #         q, k = self.rotary_emb(positions, q, k)
+        #         q, k = q.to(orig_dtype), k.to(orig_dtype)
 
-            q = q.reshape(-1, self.num_heads, self.head_dim)
-            k = k.reshape(-1, self.num_kv_heads, self.head_dim)
-            v = v.reshape(-1, self.num_kv_heads, self.head_dim)
+        #     q = q.reshape(-1, self.num_heads, self.head_dim)
+        #     k = k.reshape(-1, self.num_kv_heads, self.head_dim)
+        #     v = v.reshape(-1, self.num_kv_heads, self.head_dim)
 
-            # ALWAYS unsqueeze to (1, total_tokens, h, d)
-            q = q.unsqueeze(0)  # (1, total_tokens, num_heads, head_dim)
-            k = k.unsqueeze(0)
-            v = v.unsqueeze(0)
-            # ground truth end
+        #     # ALWAYS unsqueeze to (1, total_tokens, h, d)
+        #     q = q.unsqueeze(0)  # (1, total_tokens, num_heads, head_dim)
+        #     k = k.unsqueeze(0)
+        #     v = v.unsqueeze(0)
+        #     # ground truth end
 
         # Get backend from forward batch
         attn_backend = forward_batch.attn_backend
@@ -385,23 +384,23 @@ class MiniCPMLightningMixer(nn.Module):
             output_attentions=False,
         )
 		
-        if self.use_output_gate and self.use_output_norm:
-            z, _ = self.z_proj(hidden_states)   # [seq_len, hidden_size] -> [seq_len, 4096]
-            o = fused_output_processing(
-                o=o,
-                z=z,
-                norm_weight=self.o_norm.weight,
-                eps=self.rms_norm_eps,
-            )
-        else:
-            o = o.reshape(-1, self.num_heads * self.head_dim)
+        # if self.use_output_gate and self.use_output_norm:
+        z, _ = self.z_proj(hidden_states)   # [seq_len, hidden_size] -> [seq_len, 4096]
+        o = fused_output_processing(
+            o=o,
+            z=z,
+            norm_weight=self.o_norm.weight,
+            eps=self.rms_norm_eps,
+        )
+        # else:
+        #     o = o.reshape(-1, self.num_heads * self.head_dim)
 
-            if self.use_output_norm:
-                o = self.o_norm(o)
+        #     if self.use_output_norm:
+        #         o = self.o_norm(o)
 
-            if self.use_output_gate:
-                z, _ = self.z_proj(hidden_states)
-                o = o * F.sigmoid(z)
+        #     if self.use_output_gate:
+        #         z, _ = self.z_proj(hidden_states)
+        #         o = o * F.sigmoid(z)
 
         y, _ = self.o_proj(o)
         return y
