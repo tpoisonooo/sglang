@@ -31,7 +31,7 @@ from sglang.srt.layers.attention.minicpm_sparse_utils import (
 )
 from sglang.srt.models.minicpm_fused_norm_rope import fused_rms_norm_rope
 from sglang.srt.models.minicpm_fused_output import fused_output_processing
-from python.sglang.srt.models.minicpm_fused_scale_add import fused_scale_add
+from sglang.srt.models.minicpm_fused_scale_add import fused_scale_add
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -320,18 +320,16 @@ class MiniCPMLightningMixer(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)  # [seq_len, hidden_size] -> [seq_len, q_size+kv_size+kv_size]
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
+        # print(f'fused_rms_rope shape {q.shape}, {k.shape}, {self.num_heads}, {self.head_dim}, {self.num_kv_heads}')
 
-        # if self.qk_norm and self.use_rope:
-        if False:
-            cos_sin_cache = self.rotary_emb.cos_sin_cache  # [max_position, head_dim * 2]
-            # print(f'fused_rms_rope shape {q.shape}, {k.shape}, {self.num_heads}, {self.head_dim}')
+        if self.qk_norm and self.use_rope:
             q, k = fused_rms_norm_rope(
                 q=q,
                 k=k,
                 positions=positions,
-                cos_sin_cache=cos_sin_cache,
                 q_norm_weight=self.q_norm.weight,
                 k_norm_weight=self.k_norm.weight,
+                cos_sin_cache=self.rotary_emb.cos_sin_cache, # [max_position, head_dim * 2]
                 eps=self.rms_norm_eps,
             )
 
@@ -525,16 +523,16 @@ class MiniCPMDecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
 
-        hidden_states = fused_scale_add(hidden_states, residual, self.hidden_scale)
+        hidden_states = residual + hidden_states * self.hidden_scale
+        # hidden_states = fused_scale_add(hidden_states, residual, self.hidden_scale)
         
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        
 
-
-        hidden_states = fused_scale_add(hidden_states, residual, self.hidden_scale)
+        hidden_states = residual + hidden_states * self.hidden_scale
+        # hidden_states = fused_scale_add(hidden_states, residual, self.hidden_scale)
 
         return hidden_states, None
 

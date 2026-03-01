@@ -29,7 +29,7 @@ from sglang.srt.layers.attention.minicpm_sparse_utils import (
     SparseMetadata,
     SparseMetadataBuilder,
 )
-from sglang.srt.models.minicpm_fused_norm_rope import fused_rms_norm_rope
+from python.sglang.srt.models.minicpm_fused_norm_rope_bad import fused_rms_norm_rope
 from sglang.srt.models.minicpm_fused_output import fused_output_processing
 from python.sglang.srt.models.minicpm_fused_scale_add import fused_scale_add
 from sglang.srt.layers.layernorm import RMSNorm
