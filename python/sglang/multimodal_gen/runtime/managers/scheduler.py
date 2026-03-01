@@ -69,7 +69,7 @@ class Scheduler:
         # optim@1
         # Throughput (tokens/s): 973~985 @ io_threads=1
         # Throughput (tokens/s): 938~950 @ io_threads=2
-        self.context = zmq.Context(io_threads=1)
+        self.context = zmq.Context(io_threads=2)
         endpoint = server_args.scheduler_endpoint
         if gpu_id == 0:
             # router allocates identify (envelope) for each connection

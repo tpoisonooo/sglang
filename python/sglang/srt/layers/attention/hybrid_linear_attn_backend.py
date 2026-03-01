@@ -1575,9 +1575,8 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
         else:
             has_initial_state = (prefix_lens > 0).any() if isinstance(prefix_lens, torch.Tensor) else prefix_lens > 0
 
-        pool = self.req_to_token_pool
-        mamba_map = pool.mamba_map
-        mamba_pool = pool.mamba_pool
+        mamba_map = self.req_to_token_pool.mamba_map
+        mamba_pool = self.req_to_token_pool.mamba_pool
         cache_idx = mamba_map.get(layer_id)
         layer_cache = mamba_pool.mamba2_layer_cache(cache_idx)
 
@@ -1605,7 +1604,7 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
 
         # 52.97s  15.36s  8.67s
         # 51.68s  14.53s  7.98s
-        mode = "fused_recurrent" if seq_len < 256 else "chunk"
+        mode = "fused_recurrent" if seq_len < 64 else "chunk"
         # import pdb; pdb.set_trace()
         if forward_batch.forward_mode.is_decode() or mode == "fused_recurrent":
             o, final_state = fused_recurrent_simple_gla(
@@ -1630,13 +1629,13 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
                 cu_seqlens=self.forward_metadata.query_start_loc,
             )
 
-        # if final_state is not None:
-        # mamba_indices = self._get_mamba_indices(forward_batch)
-        # cache_idx = mamba_map.get(layer_id)
+        if final_state is not None:
+            # mamba_indices = self._get_mamba_indices(forward_batch)
+            # cache_idx = mamba_map.get(layer_id)
 
-        # if cache_idx is not None:
-        # layer_cache = mamba_pool.mamba2_layer_cache(cache_idx)
-        layer_cache.temporal[mamba_indices, :] = final_state
+            # if cache_idx is not None:
+            # layer_cache = mamba_pool.mamba2_layer_cache(cache_idx)
+            layer_cache.temporal[mamba_indices, :] = final_state
         # else:
         #     import pdb; pdb.set_trace()
         #     raise RuntimeError(
