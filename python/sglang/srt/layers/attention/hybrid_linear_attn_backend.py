@@ -38,6 +38,7 @@ from sglang.srt.layers.attention.minicpm_recurrent_simple_gla import (
 )
 from sglang.srt.layers.attention.minicpm_chunk_gla import (
     chunk_simple_gla,
+    IS_NVIDIA_BLACKWELL,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
@@ -1601,6 +1602,16 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
         # 52.97s  15.36s  8.67s
         # 51.68s  14.53s  7.98s
         mode = "fused_recurrent" if seq_len < 128 else "chunk"
+        
+        # Explicit chunk_size control for Blackwell optimization
+        # Blackwell (RTX 6000D) benefits from larger chunk sizes (128 vs 64)
+        if IS_NVIDIA_BLACKWELL:
+            # For Blackwell: use 128 for longer sequences, 64 for short ones
+            chunk_size = 64 if seq_len <= 64 else 128
+        else:
+            # Default: use 64 for most cases
+            chunk_size = 64
+        
         # import pdb; pdb.set_trace()
         if forward_batch.forward_mode.is_decode() or mode == "fused_recurrent":
             # print(f' fuse_rec_simple_gla {q.shape}, {k.shape}, {v.shape}, {g_gamma.shape}')
@@ -1625,6 +1636,7 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
                 initial_state=initial_state,
                 scale=scale,
                 cu_seqlens=self.forward_metadata.query_start_loc,
+                chunk_size=chunk_size,  # Explicit chunk size for optimization
             )
 
         if final_state is not None:
@@ -1634,6 +1646,7 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
             # if cache_idx is not None:
             # layer_cache = mamba_pool.mamba2_layer_cache(cache_idx)
             layer_cache.temporal[mamba_indices, :] = final_state
+        # else:
         # else:
         #     import pdb; pdb.set_trace()
         #     raise RuntimeError(

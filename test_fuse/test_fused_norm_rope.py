@@ -18,7 +18,7 @@ import sys
 import math
 
 # Add python path
-sys.path.insert(0, '/data/khj/workspace/sglang/python')
+sys.path.insert(0, '/root/soar2026/python')
 
 from sglang.srt.models.minicpm_fused_norm_rope import (
     fused_rms_norm_rope,
