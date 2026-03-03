@@ -66,40 +66,14 @@ def _is_blackwell_architecture():
 # Detect architecture
 IS_NVIDIA_BLACKWELL = _is_blackwell_architecture()
 
-# Block sizes for chunk processing - tuned for head_dim=128
-# Note: RTX 6000D has ~100KB shared memory per SM (similar to Ada/Hopper consumer GPUs)
-# We need to be conservative with BK/BV sizes to avoid out-of-shared-memory errors
-if IS_NVIDIA_BLACKWELL:
-    # Blackwell optimized for RTX 6000D: use moderate BK/BV (64) for best balance
-    # - 64x64 blocks fit well in ~100KB shared memory with 3-4 stages
-    # - Larger blocks (128) cause OOM with multiple stages
-    BKV_LIST = [32, 64]
-    NUM_WARPS = [4, 8]  # Higher occupancy on Blackwell
-else:
-    BKV_LIST = [32, 64] if check_shared_mem() else [16, 32]
-    NUM_WARPS = [2, 4, 8]
-
 # Default chunk size - tuned for performance
 # Blackwell benefits from larger chunks due to improved async copy engines
 DEFAULT_CHUNK_SIZE = 128 if IS_NVIDIA_BLACKWELL else 64
 
-# Blackwell-specific autotune configs for chunk_fwd_kernel_h
-# Carefully tuned for RTX 6000D shared memory limits (~100KB per SM)
-if IS_NVIDIA_BLACKWELL:
-    # Optimized for RTX 6000D (Blackwell architecture, consumer GPU)
-    # Key constraints:
-    # - Shared memory limit: ~100KB per SM
-    # - BK=64, BV=64 with num_stages=3 uses ~64KB shared memory (safe)
-    # - BK=128 causes OOM with num_stages >= 3
-    BLACKWELL_AUTOTUNE_CONFIGS = [
-        triton.Config({'BK': 64, 'BV': 64}, num_warps=8, num_stages=3),  # Best balance
-        triton.Config({'BK': 64, 'BV': 32}, num_warps=8, num_stages=4),  # Smaller BV, more stages
-        triton.Config({'BK': 32, 'BV': 64}, num_warps=8, num_stages=4),  # Smaller BK, more stages
-        triton.Config({'BK': 64, 'BV': 64}, num_warps=8, num_stages=4),  # More latency hiding
-        triton.Config({'BK': 32, 'BV': 32}, num_warps=4, num_stages=3),  # Fallback
-    ]
-else:
-    BLACKWELL_AUTOTUNE_CONFIGS = None
+# Fixed optimal configs for Blackwell (autotune removed to avoid OOM during benchmark)
+# These configs are tuned for RTX 6000D shared memory limits (~100KB per SM)
+# chunk_fwd_kernel_h: BK=64, BV=64, num_warps=8, num_stages=3
+# chunk_fwd_kernel_o: BK=128, BV=128, num_warps=8, num_stages=3
 
 
 # ============================================================================
@@ -111,22 +85,13 @@ def _is_aligned(K, V, BK, BV):
     return K % BK == 0 and V % BV == 0
 
 
+# Autotune removed - using fixed optimal config for Blackwell
+# Best config for RTX 6000D: BK=64, BV=64, num_warps=8, num_stages=3
 @triton.heuristics({
     'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
     # Note: STORE_FINAL_STATE is always True for inference
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.autotune(
-    configs=BLACKWELL_AUTOTUNE_CONFIGS if IS_NVIDIA_BLACKWELL else [
-        triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in BKV_LIST
-        for BV in BKV_LIST
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
-    key=['BT', 'USE_G', 'USE_GK', 'USE_GV'],
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=['T'])
 def chunk_fwd_kernel_h(
     k,
@@ -289,25 +254,13 @@ def chunk_fwd_kernel_h(
 # Triton Kernels for chunk_fwd_o (output computation)
 # ============================================================================
 
+# Autotune removed - using fixed optimal config for Blackwell
+# Best config for RTX 6000D: BK=128, BV=128, num_warps=8, num_stages=3
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
     'USE_G_GAMMA': lambda args: args['g_gamma'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.autotune(
-    configs=[
-        # Blackwell optimized configs (front-loaded for priority)
-        triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=3),
-        triton.Config({'BK': 128, 'BV': 128}, num_warps=16, num_stages=3),
-        triton.Config({'BK': 64, 'BV': 128}, num_warps=8, num_stages=4),
-        triton.Config({'BK': 128, 'BV': 64}, num_warps=8, num_stages=4),
-        # Fallback configs for other architectures
-        triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),
-        triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3),
-    ],
-    key=['H', 'K', 'V', 'BT'],
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=['T'])
 def chunk_fwd_kernel_o(
     q,
@@ -501,14 +454,19 @@ def chunk_fwd_h(
     h = k.new_empty(B, NS, H, K, V, dtype=k.dtype if not states_in_fp32 else torch.float)
     ht = k.new_empty(N, H, K, V, dtype=torch.float)  # Always output final state
     
+    # Fixed optimal config for Blackwell: BK=64, BV=64
+    # This avoids autotune OOM issues
+    BK = 64
+    BV = 64
+    
     # Batch=1 optimization: simplify grid calculation when B=1
     # This avoids unnecessary multiplication and is more cache-friendly
     if B == 1:
         def grid(meta): 
-            return (triton.cdiv(K, meta['BK']), triton.cdiv(V, meta['BV']), H)
+            return (triton.cdiv(K, BK), triton.cdiv(V, BV), H)
     else:
         def grid(meta): 
-            return (triton.cdiv(K, meta['BK']), triton.cdiv(V, meta['BV']), N * H)
+            return (triton.cdiv(K, BK), triton.cdiv(V, BV), N * H)
     
     chunk_fwd_kernel_h[grid](
         k=k,
@@ -528,6 +486,8 @@ def chunk_fwd_h(
         V=V,
         BT=BT,
         BS=BS,
+        BK=BK,
+        BV=BV,
         USE_G=g is not None,
         USE_G_GAMMA=g_gamma is not None,
         USE_GK=gk is not None,
@@ -587,14 +547,19 @@ def chunk_fwd_o(
 
     o = torch.empty_like(v)
     
+    # Fixed optimal config for Blackwell: BK=128, BV=128
+    # This avoids autotune OOM issues
+    BK = 128
+    BV = 128
+    
     # Batch=1 optimization: simplify grid calculation when B=1
     # For MiniCPM, batch is always 1, so this is a common case optimization
     if B == 1:
         def grid(meta): 
-            return (triton.cdiv(V, meta['BV']), NT, H)
+            return (triton.cdiv(V, BV), NT, H)
     else:
         def grid(meta): 
-            return (triton.cdiv(V, meta['BV']), NT, B * H)
+            return (triton.cdiv(V, BV), NT, B * H)
     
     chunk_fwd_kernel_o[grid](
         q=q,
@@ -612,6 +577,8 @@ def chunk_fwd_o(
         K=K,
         V=V,
         BT=BT,
+        BK=BK,
+        BV=BV,
     )
     return o
 

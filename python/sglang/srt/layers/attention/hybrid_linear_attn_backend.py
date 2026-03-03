@@ -1601,7 +1601,7 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
 
         # 52.97s  15.36s  8.67s
         # 51.68s  14.53s  7.98s
-        mode = "fused_recurrent" if seq_len < 128 else "chunk"
+        mode = "fused_recurrent" if seq_len < 64 else "chunk"
         
         # Explicit chunk_size control for Blackwell optimization
         # Blackwell (RTX 6000D) benefits from larger chunk sizes (128 vs 64)
@@ -1636,7 +1636,6 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
                 initial_state=initial_state,
                 scale=scale,
                 cu_seqlens=self.forward_metadata.query_start_loc,
-                chunk_size=chunk_size,  # Explicit chunk size for optimization
             )
 
         if final_state is not None:

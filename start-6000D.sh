@@ -108,8 +108,9 @@ docker run --rm -it   --gpus "device=6"  \
 source /opt/SGLang-MiniCPM-SALA/sglang_minicpm_sala_env/bin/activate
 uv pip install --no-deps -e /source/sglang/python
 
+#     --model /models/MiniCPM-SALA \
 python3 -m sglang.launch_server \
-    --model /models/MiniCPM-SALA \
+    --model /root/models/openbmb/MiniCPM-SALA \
     --host "0.0.0.0"  \
     --trust-remote-code \
     --port 30000 \
@@ -120,7 +121,7 @@ python3 -m sglang.launch_server \
     --tp-size 1
 
 export CUDA_VISIBLE_DEVICES="0"
-python -m sglang.bench_one_batch --model-path /models/MiniCPM-SALA  \
+python -m sglang.bench_one_batch --model-path /root/models/openbmb/MiniCPM-SALA  \
     --batch 8 --input-len 256 --output-len 32 \
     --trust-remote-code \
     --disable-radix-cache \
@@ -131,7 +132,7 @@ python -m sglang.bench_one_batch --model-path /models/MiniCPM-SALA  \
 # 原始数据 3970 @ sgl-kernel @ 0.3.20
 # 原始数据 3961 @ sgl-kernel @ 0.3.21
 
-python -m sglang.bench_one_batch --model-path /data/share/MiniCPM-SALA  \
+python -m sglang.bench_one_batch --model-path /root/models/openbmb/MiniCPM-SALA  \
     --batch 8 --input-len 256 --output-len 32 \
     --trust-remote-code \
     --disable-radix-cache \
