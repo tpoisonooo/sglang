@@ -358,15 +358,10 @@ def fused_scale_add(
     This operation is commonly used in transformer MLP layers with residual
     connections, where the MLP output is scaled before adding to the residual.
     
-    Blackwell (RTX 6000D) Optimizations Applied:
-    - seq_len <= 512: PyTorch native (low kernel launch overhead)
-    - 512 < seq_len <= 2048: Blackwell-optimized kernel (256 threads, 8 warps)
-    - seq_len > 2048: Basic kernel (1D grid, maximum memory bandwidth)
-    
-    Benchmark-based dispatch strategy:
-    - Small: PyTorch native wins due to kernel launch overhead
-    - Medium: Blackwell kernel with 128-bit vectorization (1.2-4x speedup)
-    - Large: Basic 1D kernel for pure memory bandwidth bound ops
+    Benchmark-based dispatch strategy on RTX 6000D (Blackwell):
+    - seq_len <= 512:    PyTorch native (kernel launch overhead dominates)
+    - 512 < seq_len <= 2048: Blackwell-optimized kernel (1.2-1.3x speedup)
+    - seq_len >= 4096:   Basic 1D kernel (best bandwidth utilization, 5.9x at 4096)
     
     Args:
         input_tensor: [seq_len, 4096] - typically MLP output, bfloat16
@@ -389,33 +384,36 @@ def fused_scale_add(
     seq_len, hidden_dim = input_tensor.shape
     assert hidden_dim == 4096, f"Expected hidden_dim=4096, got {hidden_dim}"
     
-    # Get GPU properties for architecture-specific optimization
-    device_props = torch.cuda.get_device_properties(input_tensor.device)
-    
-    # Check if Blackwell architecture (SM 10.0+)
-    is_blackwell = device_props.major >= 10
-    
     # Architecture and size-specific dispatch
     # Based on benchmark results on RTX 6000D (Blackwell, 156 SMs)
+    # Benchmark summary:
+    #   seq_len=128:   PyTorch 7.1ms,  Fused 8.9ms   -> 0.80x (use PyTorch)
+    #   seq_len=512:   PyTorch 8.0ms,  Fused 8.8ms   -> 0.92x (use PyTorch)
+    #   seq_len=1024:  PyTorch 11.5ms, Fused 9.4ms   -> 1.22x (use Blackwell)
+    #   seq_len=2048:  PyTorch 16.5ms, Fused 12.6ms  -> 1.31x (use Blackwell)
+    #   seq_len=4096:  PyTorch 88.1ms, Fused 14.4ms  -> 5.94x (use Basic)
+    #   seq_len=8192:  PyTorch 211ms,  Fused 158ms   -> 1.34x (use Basic)
+    #   seq_len=16384: PyTorch 519ms,  Fused 309ms   -> 1.68x (use Basic)
     if seq_len <= 512:
         # Small seq_len: PyTorch native has lower kernel launch overhead
         return residual + input_tensor * scale
     
-    elif is_blackwell and seq_len <= 2048:
-        # Medium seq_len on Blackwell: use optimized kernel with 128-bit vectorization
-        # Benchmark: 1.2-1.3x speedup over PyTorch
-        if seq_len < 64:
+    elif seq_len <= 2048:
+        # Medium seq_len: Blackwell-optimized kernel with 128-bit vectorization
+        # Best for seq_len in (512, 2048] range
+        num_sms = torch.cuda.get_device_properties(input_tensor.device).multi_processor_count
+        if seq_len < num_sms // 2:
             # Very small: use multi-row processing to improve occupancy
             return fused_scale_add_blackwell_multirow(input_tensor, residual, scale, rows_per_block=4)
-        elif seq_len < 132:
-            # Small: use 2-row processing (RTX 6000D has ~132 SMs active)
+        elif seq_len < num_sms:
+            # Small: use 2-row processing to utilize more SMs
             return fused_scale_add_blackwell_multirow(input_tensor, residual, scale, rows_per_block=2)
         else:
             return fused_scale_add_blackwell(input_tensor, residual, scale)
     
     else:
-        # Large seq_len: basic 1D kernel for maximum memory bandwidth
-        # Benchmark: basic kernel achieves ~6900 GB/s on RTX 6000D
+        # Large seq_len (>= 4096): Basic 1D kernel achieves best bandwidth
+        # Benchmark: basic kernel achieves ~6977 GB/s at seq_len=4096
         return fused_scale_add_basic(input_tensor, residual, scale)
 
 
