@@ -37,21 +37,6 @@ class Scheduler:
     This class does NOT manage worker processes.
     """
 
-    """
-    客户端请求
-        ↓ ZMQ (TCP/IPC)
-    GPU 0 (Router) 接收 → 加入 waiting_queue
-        ↓ 调度策略（连续批处理 / Chunked Prefill）
-        ├─→ GPU 0: 直接调用 self.worker.forward()
-        └─→ GPU 1~N: 通过 task_pipes_to_slaves[gpu_id] 发送
-                        ↓
-                各 GPU 并行推理
-                        ↓
-                result_pipes_from_slaves 返回结果
-        ↓ 聚合结果
-    GPU 0 通过 ZMQ 返回给对应客户端（使用 bytes 标识路由）
-    """
-
     def __init__(
         self,
         server_args: ServerArgs,
@@ -66,9 +51,6 @@ class Scheduler:
         set_global_server_args(server_args=server_args)
 
         # Inter-process Communication
-        # optim@1
-        # Throughput (tokens/s): 973~985 @ io_threads=1
-        # Throughput (tokens/s): 938~950 @ io_threads=2
         self.context = zmq.Context(io_threads=2)
         endpoint = server_args.scheduler_endpoint
         if gpu_id == 0:
