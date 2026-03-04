@@ -90,7 +90,7 @@ uv build --sdist --no-build-isolation
 
 # 新版试运行
 # 先进 docker
-docker run --rm -it   --gpus "device=0"  \
+docker run --rm -it   --gpus "device=1"  \
     --privileged --runtime=nvidia -p 30000:30000 \
     -v /data/share/MiniCPM-SALA:/models/MiniCPM-SALA:ro \
     -v /home/khj/workspace/sglang:/source/sglang \
@@ -107,6 +107,7 @@ docker run --rm -it   --gpus "device=6"  \
 source /opt/SGLang-MiniCPM-SALA/sglang_minicpm_sala_env/bin/activate
 uv pip install --no-deps -e /source/sglang/python
 
+# 浮点版
 python3 -m sglang.launch_server \
     --model /models/MiniCPM-SALA \
     --host "0.0.0.0"  \
@@ -116,10 +117,38 @@ python3 -m sglang.launch_server \
     --attention-backend minicpm_flashinfer \
     --chunked-prefill-size 32768 --skip-server-warmup --dense-as-sparse \
     --max-running-requests 32 \
-    --tp-size 1
+    --tp-size 1 \
+    --kv-cache-dtype fp8_e5m2
+
+# 量化版
+python3 -m sglang.launch_server \
+    --model /models/MiniCPM-SALA-quant \
+    --host "0.0.0.0"  \
+    --trust-remote-code \
+    --port 30000 \
+    --disable-radix-cache \
+    --attention-backend minicpm_flashinfer \
+    --chunked-prefill-size 32768 --skip-server-warmup --dense-as-sparse \
+    --max-running-requests 32 \
+    --tp-size 1 \
+    --quantization gptq_marlin \
+    --kv-cache-dtype fp8_e5m2 \
+    --dtype float16
+
+python -m sglang.bench_one_batch --model-path /models/MiniCPM-SALA-quant  \
+    --batch 32 --input-len 256 --output-len 32 \
+    --trust-remote-code \
+    --disable-radix-cache \
+    --attention-backend minicpm_flashinfer \
+    --chunked-prefill-size 8192 --skip-server-warmup --dense-as-sparse \
+    --tp-size 1 \
+    --kv-cache-dtype fp8_e5m2 \
+    --dtype float16 \
+    --quantization gptq_marlin \
+    --disable-cuda-graph
 
 export CUDA_VISIBLE_DEVICES="0"
-python -m sglang.bench_one_batch --model-path /models/MiniCPM-SALA  \
+python -m sglang.bench_one_batch --model-path /data/share/MiniCPM-SALA  \
     --batch 32 --input-len 256 --output-len 32 \
     --trust-remote-code \
     --disable-radix-cache \
