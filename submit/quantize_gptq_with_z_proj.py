@@ -1,7 +1,38 @@
 import os
 import pandas as pd
-from gptqmodel import GPTQModel, QuantizeConfig
+from gptqmodel import QuantizeConfig, GPTQModel, BaseQModel
+from gptqmodel.models import MODEL_MAP
 # import pdb; pdb.set_trace()
+
+class MiniCPMSALAQModel(BaseQModel):
+    """
+    MiniCPM SALA (Sparse Attention with Linear Attention) model support.
+    
+    This model supports two mixer types:
+    1. minicpm4: Standard attention with optional output gate (o_gate)
+    2. lightning: Lightning attention with output gate (z_proj)
+    
+    Note: z_proj is not quantized as per the original model design.
+    """
+    
+    pre_lm_head_norm_module = "model.norm"
+    layer_modules_strict = False  # 允许动态模块
+
+    # Module tree for MiniCPM SALA model
+    module_tree = [
+        "model",
+        "layers",
+        "#",
+        {
+            "input_layernorm": ("input_layernorm:!",),
+            "self_attn": ("q_proj:0", "k_proj:0", "v_proj:0", "o_proj:1", "o_gate:1", "z_proj:1"),
+            "post_attention_layernorm": ("post_attention_layernorm:!",),
+            "mlp": ("gate_proj:0", "up_proj:0", "down_proj:1"),
+        }
+    ]
+
+MODEL_MAP['minicpm_sala'] = MiniCPMSALAQModel
+
 
 def load_q_dataset():
     script_dir = os.path.dirname(os.path.abspath(__file__))
