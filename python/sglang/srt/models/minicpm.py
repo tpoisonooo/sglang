@@ -285,10 +285,12 @@ class MiniCPMLightningMixer(nn.Module):
             self.o_norm = RMSNorm(self.num_heads * self.head_dim, eps=self.rms_norm_eps)
 
         if self.use_output_gate:
+            # Note: z_proj is not quantized in the checkpoint, so we don't pass quant_config
             self.z_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.total_num_heads * self.head_dim,
                 bias=self.attention_bias,
+                # quant_config=None,  # z_proj is not quantized
                 quant_config=quant_config,
                 prefix=add_prefix("z_proj", prefix),
             )
@@ -693,6 +695,15 @@ class MiniCPMSALAForCausalLM(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
+
+                    # 在查找 params_dict 之前，处理 GPTQ 后缀
+                    if name.endswith(".weight") and name not in params_dict:
+                        # 尝试 GPTQ 命名
+                        gptq_name = name.replace(".weight", ".qweight")
+                        if gptq_name in params_dict:
+                            name = gptq_name
+                        # 如果检查点里存的是 scales/qzeros/g_idx，它们应该直接匹配
+     
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader

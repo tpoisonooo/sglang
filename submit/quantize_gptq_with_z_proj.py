@@ -1,6 +1,10 @@
 import os
+from anyio import Path
 import pandas as pd
-from gptqmodel import QuantizeConfig, GPTQModel, BaseQModel
+import argparse
+
+from gptqmodel import QuantizeConfig, GPTQModel
+from gptqmodel.models.base import BaseQModel
 from gptqmodel.models import MODEL_MAP
 # import pdb; pdb.set_trace()
 
@@ -25,7 +29,7 @@ class MiniCPMSALAQModel(BaseQModel):
         "#",
         {
             "input_layernorm": ("input_layernorm:!",),
-            "self_attn": ("q_proj:0", "k_proj:0", "v_proj:0", "o_proj:1", "o_gate:1", "z_proj:1"),
+            "self_attn": ("q_proj:0", "k_proj:0", "v_proj:0", "o_proj:1", "o_gate:1", "z_proj:2"),
             "post_attention_layernorm": ("post_attention_layernorm:!",),
             "mlp": ("gate_proj:0", "up_proj:0", "down_proj:1"),
         }
@@ -38,6 +42,7 @@ def load_q_dataset():
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
     files = ['common.jsonl', 'math.jsonl', 'extra.jsonl']
+    # files = ['extra.jsonl']
     calibration_dataset = []
     for filename in files:
         # 获取脚本所在目录，拼接 jsonl 路径
@@ -47,13 +52,21 @@ def load_q_dataset():
         calibration_dataset += df["question"].tolist()
     return calibration_dataset
 
-model_path = "/data/share/MiniCPM-SALA"
-quant_path = "/data/share/MiniCPM-SALA-int4-128"
+def main():
+    parser = argparse.ArgumentParser(description="RTN W4A16 quantization")
+    parser.add_argument("--input", required=True, default='/data/share/MiniCPM-SALA', help="Original model directory")
+    parser.add_argument("--output", required=True, default='/data/share/MiniCPM-SALA-int4', help="Quantized model output directory")
+    parser.add_argument("--group-size", type=int, default=1024)
+    parser.add_argument("--bits", type=int, default=4)
+    args = parser.parse_args()
 
-quant_config = QuantizeConfig(bits=4, group_size=128) # quantization config
-model = GPTQModel.load(model_path, quant_config, trust_remote_code=True, attn_implementation="flash_attention_2") # load model
+    model_path = args.input
+    quant_path = args.output
 
-model.layer_modules_strict = False
-calibration_dataset = load_q_dataset()
-model.quantize(calibration_dataset, batch_size=2) # quantize
-model.save(quant_path) # save model
+    quant_config = QuantizeConfig(bits=4, group_size=128) # quantization config
+    model = GPTQModel.load(model_path, quant_config, trust_remote_code=True, attn_implementation="flash_attention_2") # load model
+
+    model.layer_modules_strict = False
+    calibration_dataset = load_q_dataset()
+    model.quantize(calibration_dataset, batch_size=2) # quantize
+    model.save(quant_path) # save model

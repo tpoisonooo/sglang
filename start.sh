@@ -135,6 +135,7 @@ python3 -m sglang.launch_server \
     --kv-cache-dtype fp8_e5m2 \
     --dtype float16
 
+
 python -m sglang.bench_one_batch --model-path /models/MiniCPM-SALA-quant  \
     --batch 32 --input-len 256 --output-len 32 \
     --trust-remote-code \

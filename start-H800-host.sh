@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 安装 
 bash install_minicpm_sala.sh https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 
@@ -6,16 +5,16 @@ python3 -m sglang.launch_server --model /data/share/MiniCPM-SALA  --host "0.0.0.
 
 python -m sglang.launch_server --model /data/share/MiniCPM-SALA  --port 31111
 
-python -m sglang.bench_one_batch --model-path /root/models/openbmb/MiniCPM-SALA  \
-    --batch 4 --input-len 256 --output-len 32 \
+python -m sglang.bench_one_batch --model-path /data/share/MiniCPM-SALA  \
+    --batch 8 --input-len 256 --output-len 32 \
     --trust-remote-code \
     --disable-radix-cache \
     --attention-backend minicpm_flashinfer \
-    --chunked-prefill-size 512 --skip-server-warmup --dense-as-sparse \
+    --chunked-prefill-size 8192 --skip-server-warmup --dense-as-sparse \
     --tp-size 1
 
 python3 -m sglang.launch_server \
-    --model /root/models/openbmb/MiniCPM-SALA \
+    --model /data/share/MiniCPM-SALA \
     --host "0.0.0.0"  \
     --trust-remote-code \
     --port 30000 \
@@ -24,20 +23,6 @@ python3 -m sglang.launch_server \
     --chunked-prefill-size 32768 --skip-server-warmup --dense-as-sparse \
     --max-running-requests 32 \
     --tp-size 1
-
-python3 -m sglang.launch_server \
-    --model /root/models/openbmb/MiniCPM-SALA \
-    --host "0.0.0.0"  \
-    --trust-remote-code \
-    --port 30000 \
-    --disable-radix-cache \
-    --attention-backend minicpm_flashinfer \
-    --chunked-prefill-size 32768 --skip-server-warmup --dense-as-sparse \
-    --max-running-requests 32 \
-    --tp-size 1 \
-    --kv-cache-dtype fp8_e4m3 \
-    --disable-cuda-graph \
-    --dtype float16
 
 # 参考docker启动命令
 docker stop sglang-server
@@ -105,7 +90,7 @@ uv build --sdist --no-build-isolation
 
 # 新版试运行
 # 先进 docker
-docker run --rm -it   --gpus "device=0"  \
+docker run --rm -it   --gpus "device=1"  \
     --privileged --runtime=nvidia -p 30000:30000 \
     -v /data/share/MiniCPM-SALA:/models/MiniCPM-SALA:ro \
     -v /home/khj/workspace/sglang:/source/sglang \
@@ -122,9 +107,9 @@ docker run --rm -it   --gpus "device=6"  \
 source /opt/SGLang-MiniCPM-SALA/sglang_minicpm_sala_env/bin/activate
 uv pip install --no-deps -e /source/sglang/python
 
-#     --model /models/MiniCPM-SALA \
+# 浮点版
 python3 -m sglang.launch_server \
-    --model /root/models/openbmb/MiniCPM-SALA \
+    --model /data/share/MiniCPM-SALA \
     --host "0.0.0.0"  \
     --trust-remote-code \
     --port 30000 \
@@ -132,10 +117,50 @@ python3 -m sglang.launch_server \
     --attention-backend minicpm_flashinfer \
     --chunked-prefill-size 32768 --skip-server-warmup --dense-as-sparse \
     --max-running-requests 32 \
-    --tp-size 1
+    --tp-size 1 \
+    --kv-cache-dtype fp8_e4m3
+
+# 量化版
+python3 -m sglang.launch_server \
+    --model /models/MiniCPM-SALA-quant \
+    --host "0.0.0.0"  \
+    --trust-remote-code \
+    --port 30000 \
+    --disable-radix-cache \
+    --attention-backend minicpm_flashinfer \
+    --chunked-prefill-size 32768 --skip-server-warmup --dense-as-sparse \
+    --max-running-requests 32 \
+    --tp-size 1 \
+    --quantization gptq_marlin \
+    --kv-cache-dtype fp8_e5m2 \
+    --dtype float16
+
+python3 -m sglang.launch_server \
+    --model /models/MiniCPM-SALA-quant \
+    --host "0.0.0.0"  \
+    --trust-remote-code \
+    --port 30000 \
+    --disable-radix-cache \
+    --attention-backend minicpm_flashinfer \
+    --chunked-prefill-size 32768 --skip-server-warmup --dense-as-sparse \
+    --max-running-requests 32 \
+    --tp-size 1 \
+    --kv-cache-dtype fp8_e4m3
+
+python -m sglang.bench_one_batch --model-path /models/MiniCPM-SALA-quant  \
+    --batch 8 --input-len 256 --output-len 32 \
+    --trust-remote-code \
+    --disable-radix-cache \
+    --attention-backend minicpm_flashinfer \
+    --chunked-prefill-size 8192 --skip-server-warmup --dense-as-sparse \
+    --tp-size 1 \
+    --kv-cache-dtype fp8_e5m2 \
+    --dtype float16 \
+    --quantization gptq_marlin \
+    --disable-cuda-graph
 
 export CUDA_VISIBLE_DEVICES="0"
-python -m sglang.bench_one_batch --model-path /root/models/openbmb/MiniCPM-SALA  \
+python -m sglang.bench_one_batch --model-path /data/share/MiniCPM-SALA  \
     --batch 8 --input-len 256 --output-len 32 \
     --trust-remote-code \
     --disable-radix-cache \
@@ -146,10 +171,57 @@ python -m sglang.bench_one_batch --model-path /root/models/openbmb/MiniCPM-SALA 
 # 原始数据 3970 @ sgl-kernel @ 0.3.20
 # 原始数据 3961 @ sgl-kernel @ 0.3.21
 
-python -m sglang.bench_one_batch --model-path /root/models/openbmb/MiniCPM-SALA  \
+python -m sglang.bench_one_batch --model-path /data/share/MiniCPM-SALA  \
     --batch 8 --input-len 256 --output-len 32 \
     --trust-remote-code \
     --disable-radix-cache \
     --attention-backend minicpm_flashinfer \
     --chunked-prefill-size 8192 --skip-server-warmup --dense-as-sparse \
     --tp-size 1
+
+# 这个可以正常跑
+python -m sglang.launch_server \
+    --model-path /data/share/MiniCPM-SALA \
+    --host 0.0.0.0 --port 30000 \
+    --quantization fp8 \
+    --kv-cache-dtype fp8_e4m3
+
+python -m sglang.launch_server \
+    --model-path /data/share/MiniCPM-SALA-int4 \
+    --host 0.0.0.0 --port 30000 \
+    --kv-cache-dtype fp8_e4m3
+
+python -m sglang.bench_one_batch \
+    --model-path /data/share/MiniCPM-SALA-int4  \
+    --batch 8 --input-len 256 --output-len 32 \
+    --trust-remote-code \
+    --disable-radix-cache \
+    --chunked-prefill-size 8192 --skip-server-warmup --dense-as-sparse \
+    --tp-size 1 \
+    --kv-cache-dtype fp8_e4m3
+
+python3 -m sglang.launch_server \
+    --model /data/share/MiniCPM-SALA-int4 \
+    --host "0.0.0.0"  \
+    --trust-remote-code \
+    --port 30000 \
+    --disable-radix-cache \
+    # --attention-backend minicpm_flashinfer \
+    --chunked-prefill-size 32768 --skip-server-warmup --dense-as-sparse \
+    --max-running-requests 32 \
+    --tp-size 1 \
+    --kv-cache-dtype fp8_e4m3
+
+# modelopt 量化，应该是量化了整个 attn，不适合 hybrid
+python3 -m pip install nvidia-modelopt accelerate
+# install
+pip install gptqmodel --no-build-isolation -v
+
+python examples/usage/modelopt_quantize_and_export.py quantize \
+    --model-path /data/share/MiniCPM-SALA \
+    --export-dir ./MiniCPM-SALA-fp8 \
+    --quantization-method modelopt_fp8
+
+# gptqmodel 量化
+# export PYTHONPATH=/home/khj/miniconda3/lib/python3.12/site-packages:$PYTHONPATH
+

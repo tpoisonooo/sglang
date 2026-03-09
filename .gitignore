@@ -265,3 +265,5 @@ python/sglang/_version.py
 sgl-kernel/csrc/elementwise/test/
 sgl-kernel/csrc/test_rmsnorm/
 timecost
+submit/perf_public_set.jsonl
+submit/gptqmodel_offload/
