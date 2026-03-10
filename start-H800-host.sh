@@ -30,11 +30,28 @@ docker rm sglang-server
 docker run --name sglang-server \
   --runtime=nvidia \
   --privileged \
-  --gpus 'device=4' \
+  --gpus 'device=0' \
   -p 30000:30000 \
   -v /data/share/MiniCPM-SALA:/models/MiniCPM-SALA:ro \
   modelbest-registry.cn-beijing.cr.aliyuncs.com/public/soar-toolkit:latest 
 
+python -m sglang.bench_one_batch \
+    --model-path /models/MiniCPM-SALA-int4  \
+    --batch 8 --input-len 256 --output-len 32 \
+    --trust-remote-code \
+    --disable-radix-cache \
+    --chunked-prefill-size 8192 --skip-server-warmup --dense-as-sparse \
+    --tp-size 1 \
+    --kv-cache-dtype fp8_e4m3
+
+python -m sglang.bench_one_batch \
+    --model-path /models/test  \
+    --batch 8 --input-len 256 --output-len 32 \
+    --trust-remote-code \
+    --disable-radix-cache \
+    --chunked-prefill-size 8192 --skip-server-warmup \
+    --tp-size 1 \
+    --kv-cache-dtype fp8_e4m3
 
 /home/khj/workspace/sglang
 
@@ -90,7 +107,9 @@ uv build --sdist --no-build-isolation
 
 # 新版试运行
 # 先进 docker
-docker run --rm -it   --gpus "device=1"  \
+docker stop sglang-server
+docker rm sglang-server
+docker run --rm -it --gpus "device=0"  \
     --privileged --runtime=nvidia -p 30000:30000 \
     -v /data/share/MiniCPM-SALA:/models/MiniCPM-SALA:ro \
     -v /home/khj/workspace/sglang:/source/sglang \
@@ -106,6 +125,8 @@ docker run --rm -it   --gpus "device=6"  \
 
 source /opt/SGLang-MiniCPM-SALA/sglang_minicpm_sala_env/bin/activate
 uv pip install --no-deps -e /source/sglang/python
+uv pip install gptqmodel==5.7.0 torchao==0.9.0 https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+uv pip install gptqmodel==5.7.0 torchao==0.9.0 --override <(echo -e "gptqmodel==5.7.0\ntorchao==0.9.0")  https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 
 # 浮点版
 python3 -m sglang.launch_server \
@@ -198,6 +219,7 @@ python -m sglang.bench_one_batch \
     --disable-radix-cache \
     --chunked-prefill-size 8192 --skip-server-warmup --dense-as-sparse \
     --tp-size 1 \
+    --attention-backend flashinfer \
     --kv-cache-dtype fp8_e4m3
 
 python3 -m sglang.launch_server \
@@ -206,7 +228,7 @@ python3 -m sglang.launch_server \
     --trust-remote-code \
     --port 30000 \
     --disable-radix-cache \
-    # --attention-backend minicpm_flashinfer \
+    --attention-backend flashinfer \
     --chunked-prefill-size 32768 --skip-server-warmup --dense-as-sparse \
     --max-running-requests 32 \
     --tp-size 1 \

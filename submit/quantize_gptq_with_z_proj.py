@@ -64,9 +64,12 @@ def main():
     quant_path = args.output
 
     quant_config = QuantizeConfig(bits=4, group_size=128) # quantization config
-    model = GPTQModel.load(model_path, quant_config, trust_remote_code=True, attn_implementation="flash_attention_2") # load model
+    # model = GPTQModel.load(model_path, quant_config, trust_remote_code=True, attn_implementation="flash_attention_2") # load model
+    model = GPTQModel.load(model_path, quant_config, trust_remote_code=True) # load model
 
     model.layer_modules_strict = False
     calibration_dataset = load_q_dataset()
     model.quantize(calibration_dataset, batch_size=2) # quantize
     model.save(quant_path) # save model
+
+main()
