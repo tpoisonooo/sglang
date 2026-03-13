@@ -113,6 +113,7 @@ docker run --rm -it --gpus "device=0"  \
     --privileged --runtime=nvidia -p 30000:30000 \
     -v /data/share/MiniCPM-SALA:/models/MiniCPM-SALA:ro \
     -v /home/khj/workspace/sglang:/source/sglang \
+    -v /data/share/MiniCPM-SALA-int4:/models/MiniCPM-SALA-int4:ro \
     --entrypoint=/bin/bash \
     modelbest-registry.cn-beijing.cr.aliyuncs.com/public/soar-toolkit:latest
 
@@ -141,44 +142,26 @@ python3 -m sglang.launch_server \
     --tp-size 1 \
     --kv-cache-dtype fp8_e4m3
 
-# 量化版
 python3 -m sglang.launch_server \
-    --model /models/MiniCPM-SALA-quant \
+    --model /data/share/MiniCPM-SALA-int4-2 \
     --host "0.0.0.0"  \
     --trust-remote-code \
     --port 30000 \
     --disable-radix-cache \
-    --attention-backend minicpm_flashinfer \
-    --chunked-prefill-size 32768 --skip-server-warmup --dense-as-sparse \
-    --max-running-requests 32 \
-    --tp-size 1 \
-    --quantization gptq_marlin \
-    --kv-cache-dtype fp8_e5m2 \
-    --dtype float16
-
-python3 -m sglang.launch_server \
-    --model /models/MiniCPM-SALA-quant \
-    --host "0.0.0.0"  \
-    --trust-remote-code \
-    --port 30000 \
-    --disable-radix-cache \
-    --attention-backend minicpm_flashinfer \
+    --attention-backend flashinfer \
     --chunked-prefill-size 32768 --skip-server-warmup --dense-as-sparse \
     --max-running-requests 32 \
     --tp-size 1 \
     --kv-cache-dtype fp8_e4m3
 
-python -m sglang.bench_one_batch --model-path /models/MiniCPM-SALA-quant  \
+python -m sglang.bench_one_batch --model-path /data/share/MiniCPM-SALA-int4-2  \
     --batch 8 --input-len 256 --output-len 32 \
     --trust-remote-code \
     --disable-radix-cache \
-    --attention-backend minicpm_flashinfer \
+    --attention-backend flashinfer \
     --chunked-prefill-size 8192 --skip-server-warmup --dense-as-sparse \
     --tp-size 1 \
-    --kv-cache-dtype fp8_e5m2 \
-    --dtype float16 \
-    --quantization gptq_marlin \
-    --disable-cuda-graph
+    --kv-cache-dtype fp8_e5m2
 
 export CUDA_VISIBLE_DEVICES="0"
 python -m sglang.bench_one_batch --model-path /data/share/MiniCPM-SALA  \
@@ -228,10 +211,10 @@ python3 -m sglang.launch_server \
     --trust-remote-code \
     --port 30000 \
     --disable-radix-cache \
-    --attention-backend flashinfer \
     --chunked-prefill-size 32768 --skip-server-warmup --dense-as-sparse \
     --max-running-requests 32 \
     --tp-size 1 \
+    --attention-backend flashinfer \
     --kv-cache-dtype fp8_e4m3
 
 # modelopt 量化，应该是量化了整个 attn，不适合 hybrid

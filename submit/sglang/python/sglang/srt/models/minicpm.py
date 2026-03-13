@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 """Inference-only MiniCPM model compatible with HuggingFace weights."""
-
 import math
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -49,7 +48,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
-
 
 class MiniCPMMLP(nn.Module):
     def __init__(
@@ -286,11 +284,13 @@ class MiniCPMLightningMixer(nn.Module):
             self.o_norm = RMSNorm(self.num_heads * self.head_dim, eps=self.rms_norm_eps)
 
         if self.use_output_gate:
+            # Note: z_proj is not quantized in the checkpoint, so we don't pass quant_config
             self.z_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.total_num_heads * self.head_dim,
                 bias=self.attention_bias,
-                quant_config=quant_config,
+                quant_config=None,  # z_proj is not quantized
+                # quant_config=quant_config,
                 prefix=add_prefix("z_proj", prefix),
             )
 
@@ -309,14 +309,15 @@ class MiniCPMLightningMixer(nn.Module):
 
         self.layer_id = layer_id
         self.state_shape = (self.num_kv_heads, self.head_dim, self.head_dim)
-
+        
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        
+        qkv, _ = self.qkv_proj(hidden_states)  # [seq_len, hidden_size] -> [seq_len, q_size+kv_size+kv_size]
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # print(f'fused_rms_rope shape {q.shape}, {k.shape}, {self.num_heads}, {self.head_dim}, {self.num_kv_heads}')
@@ -523,7 +524,6 @@ class MiniCPMDecoderLayer(nn.Module):
         )
 
         hidden_states = residual + hidden_states * self.hidden_scale
-        # hidden_states = fused_scale_add(hidden_states, residual, self.hidden_scale)
         
         # Fully Connected
         residual = hidden_states
@@ -531,7 +531,6 @@ class MiniCPMDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
 
         hidden_states = residual + hidden_states * self.hidden_scale
-        # hidden_states = fused_scale_add(hidden_states, residual, self.hidden_scale)
 
         return hidden_states, None
 
@@ -693,6 +692,15 @@ class MiniCPMSALAForCausalLM(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
+
+                    # 在查找 params_dict 之前，处理 GPTQ 后缀
+                    if name.endswith(".weight") and name not in params_dict:
+                        # 尝试 GPTQ 命名
+                        gptq_name = name.replace(".weight", ".qweight")
+                        if gptq_name in params_dict:
+                            name = gptq_name
+                        # 如果检查点里存的是 scales/qzeros/g_idx，它们应该直接匹配
+     
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader

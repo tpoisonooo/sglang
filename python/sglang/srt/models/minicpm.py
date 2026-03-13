@@ -290,8 +290,8 @@ class MiniCPMLightningMixer(nn.Module):
                 self.hidden_size,
                 self.total_num_heads * self.head_dim,
                 bias=self.attention_bias,
-                # quant_config=None,  # z_proj is not quantized
-                quant_config=quant_config,
+                quant_config=None,  # z_proj is not quantized
+                # quant_config=quant_config,
                 prefix=add_prefix("z_proj", prefix),
             )
 
