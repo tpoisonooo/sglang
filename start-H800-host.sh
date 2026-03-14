@@ -69,6 +69,13 @@ python3 eval_model.py \
   --concurrency 32
 
 
+python3 eval_model.py \
+  --api_base http://127.0.0.1:30000 \
+  --model_name /data/share/MiniCPM-SALA \
+  --data_path /data/khj/workspace/sglang/perf_public_set.jsonl \
+  --concurrency 32
+
+
 # 测试代码
 SGL_KERNEL_DEBUG=1 python -m sglang.bench_one_batch --model-path /data/share/MiniCPM-SALA   \
    --batch 4 --input-len 1024 --output-len 512  \
@@ -143,7 +150,7 @@ python3 -m sglang.launch_server \
     --kv-cache-dtype fp8_e4m3
 
 python3 -m sglang.launch_server \
-    --model /data/share/MiniCPM-SALA-int4-2 \
+    --model /data/share/MiniCPM-SALA-int4 \
     --host "0.0.0.0"  \
     --trust-remote-code \
     --port 30000 \
@@ -191,7 +198,7 @@ python -m sglang.launch_server \
     --kv-cache-dtype fp8_e4m3
 
 python -m sglang.launch_server \
-    --model-path /data/share/MiniCPM-SALA-int4 \
+    --model-path /data/share/MiniCPM-SALA-int4-3 \
     --host 0.0.0.0 --port 30000 \
     --kv-cache-dtype fp8_e4m3
 

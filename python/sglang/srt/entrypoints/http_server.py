@@ -37,6 +37,8 @@ from typing import (
     Union,
 )
 
+import aiohttp
+
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
@@ -1200,6 +1202,26 @@ async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
+    # Async POST to remote HTTP server to log the user query
+    
+    # try:
+    #     remote_url = os.getenv("SGLANG_REMOTE_LOG_URL", "http://localhost:10005/log")
+    #     async with aiohttp.ClientSession() as session:
+    #         payload = {
+    #             "model": request.model,
+    #             "messages": [msg.model_dump() for msg in request.messages],
+    #             "timestamp": time.time(),
+    #         }
+    #         async with session.post(
+    #             remote_url,
+    #             json=payload,
+    #             timeout=aiohttp.ClientTimeout(total=3),
+    #         ) as resp:
+    #             if resp.status != 200:
+    #                 logger.warning(f"Failed to log request to remote server: {resp.status}")
+    # except Exception as e:
+    #     logger.warning(f"Failed to forward request to remote server: {e}")
+
     return await raw_request.app.state.openai_serving_chat.handle_request(
         request, raw_request
     )
