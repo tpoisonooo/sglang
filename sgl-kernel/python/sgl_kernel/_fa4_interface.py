@@ -64,6 +64,13 @@ def _flash_attn_fwd(
     lse: Optional[torch.Tensor] = None,
     buffers: Optional[list[torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    # HACK: Convert FP8 to BF16 for FA4 (FA4 doesn't support FP8)
+    if q.dtype == torch.float8_e4m3fn or q.dtype == torch.float8_e5m2:
+        q = q.to(torch.bfloat16)
+    if k.dtype == torch.float8_e4m3fn or k.dtype == torch.float8_e5m2:
+        k = k.to(torch.bfloat16)
+    if v.dtype == torch.float8_e4m3fn or v.dtype == torch.float8_e5m2:
+        v = v.to(torch.bfloat16)
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:

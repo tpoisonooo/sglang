@@ -236,6 +236,12 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             linear_attn_backend = KimiLinearAttnBackend(runner)
         elif runner.minicpm_hybrid_config is not None:
             linear_attn_backend = SimpleGLAAttnBackend(runner)
+            # HACK: Force use FA4 for full attention in MiniCPM
+            from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionBackend,
+            )
+
+            full_attn_backend = FlashAttentionBackend(runner, fa_impl_ver=4)
         else:
             raise ValueError(
                 "Expected hybrid GDN, NemotronH, or MiniCPM hybrid models, but got unknown model."

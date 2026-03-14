@@ -8,6 +8,11 @@ from gptqmodel.models.base import BaseQModel
 from gptqmodel.models import MODEL_MAP
 # import pdb; pdb.set_trace()
 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# import torch
+# torch.set_float32_matmul_precision('medium')  # 允许 TF32，略快略省内存
+
 class MiniCPMSALAQModel(BaseQModel):
     """
     MiniCPM SALA (Sparse Attention with Linear Attention) model support.
@@ -23,21 +28,21 @@ class MiniCPMSALAQModel(BaseQModel):
     layer_modules_strict = False  # 允许动态模块
 
     # Module tree for MiniCPM SALA model
+
     module_tree = [
-        "model",
-        "layers",
-        "#",
+        'model', 
+        'layers', 
+        '#', 
         {
-            "input_layernorm": ("input_layernorm:!",),
-            "self_attn": ("q_proj:0", "k_proj:0", "v_proj:0", "o_proj:1", "o_gate:2", "z_proj:!"),
-            "post_attention_layernorm": ("post_attention_layernorm:!",),
-            "mlp": ("gate_proj:0", "up_proj:0", "down_proj:1"),
+            'mlp': ('gate_proj', 'up_proj', 'down_proj'), 
+            'self_attn': ('q_proj', 'k_proj', 'v_proj', 'o_proj', 'o_gate', 'z_proj')
         }
     ]
+
 # 每次调整 量化的 layer 后，需要改动：
 # 1. minicpm.py  里的 opr 的quant参数
 # 2. submit 里 minicpm.py 对应修改
-# 3. prepare_model里的 md5
+# 3. prepare_model 里的 md5
 
 # 20260310 中午提交
 # "self_attn": ("q_proj:0", "k_proj:0", "v_proj:0", "o_proj:1", "o_gate:1", "z_proj:2") 对应的精度：
@@ -68,7 +73,18 @@ class MiniCPMSALAQModel(BaseQModel):
 }
 """
 # 20260311 中午提交
-
+"""
+{
+  "acc": 98.81,
+  "acc_ori": 79.04,
+  "final_score": 74.92,
+  "benchmark_duration": {
+    "S1": 434.16,
+    "S8": 594.42,
+    "Smax": 1067.92
+  }
+}
+"""
 
 # o_gate 后面有 F.sigmoid 还好； down_proj 属于 MLP 最后一层，影响比较大。
 # GT 是  82.24%
@@ -78,7 +94,7 @@ class MiniCPMSALAQModel(BaseQModel):
 # GT + common + math + fp8_kvcache + 首尾 g128 模型在 /data/share/minicpm   78.64%
 # GT + common + math + fp8_kvcache + 首尾 g128 + 放弃 downgate   76.18%
 
-# MODEL_MAP['minicpm_sala'] = MiniCPMSALAQModel
+MODEL_MAP['minicpm_sala'] = MiniCPMSALAQModel
 
 def load_q_dataset():
     script_dir = os.path.dirname(os.path.abspath(__file__))

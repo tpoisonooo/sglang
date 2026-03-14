@@ -62,11 +62,11 @@ export SPEED_DATA_SMAX=/home/khj/workspace/sglang/speech.jsonl
 bash ../SOAR-Toolkit/bench_serving.sh  http://127.0.0.1:30000
 
 # 测精度
-python3 eval_model.py \
+python3 ../SOAR-Toolkit/eval_model.py \
   --api_base http://127.0.0.1:30000 \
   --model_name /models/MiniCPM-SALA \
   --data_path /data/khj/workspace/sglang/perf_public_set.jsonl \
-  --concurrency 32
+  --concurrency 16
 
 
 python3 eval_model.py \
@@ -155,7 +155,8 @@ python3 -m sglang.launch_server \
     --trust-remote-code \
     --port 30000 \
     --disable-radix-cache \
-    --attention-backend flashinfer \
+    --prefill-attention-backend fa4 \
+    --decode-attention-backend flashinfer \
     --chunked-prefill-size 32768 --skip-server-warmup --dense-as-sparse \
     --max-running-requests 32 \
     --tp-size 1 \
