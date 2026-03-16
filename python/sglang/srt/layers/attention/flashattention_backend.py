@@ -798,9 +798,8 @@ class FlashAttentionBackend(AttentionBackend):
 
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
         kwargs = {}
-        # HACK: For decode, always use FA3 (even if fa_impl_ver is 4)
         if self.fa_impl_ver != 3:
-            kwargs["ver"] = 3  # Force FA3 for decode
+            kwargs["ver"] = self.fa_impl_ver
         if sinks is not None:
             kwargs["sinks"] = sinks
 
@@ -838,12 +837,6 @@ class FlashAttentionBackend(AttentionBackend):
             key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
-            # HACK: For FA4, convert FP8 KV cache to BF16 (FA4 doesn't support FP8)
-            if self.fa_impl_ver == 4:
-                if key_cache.dtype == torch.float8_e4m3fn or key_cache.dtype == torch.float8_e5m2:
-                    key_cache = key_cache.to(torch.bfloat16)
-                if value_cache.dtype == torch.float8_e4m3fn or value_cache.dtype == torch.float8_e5m2:
-                    value_cache = value_cache.to(torch.bfloat16)
             key_cache = key_cache.view(
                 -1, self.page_size, layer.tp_k_head_num, layer.head_dim
             )
@@ -1063,28 +1056,7 @@ class FlashAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Forward decode with FA4/FA3 auto-switch."""
-        # HACK: FA4 only supports prefill, use FA3 for decode
-        # Always use FA3 implementation for decode
-        return self._forward_decode_fa3(
-            q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope, sinks
-        )
-
-    def _forward_decode_fa3(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: RadixAttention,
-        forward_batch: ForwardBatch,
-        save_kv_cache=True,
-        # For multi-head latent attention
-        q_rope: Optional[torch.Tensor] = None,
-        k_rope: Optional[torch.Tensor] = None,
-        sinks: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Actual FA3 decode implementation (also used by FA4 for decode)."""
-        # NOTE: This method is called by both FA3 and FA4 (FA4 uses FA3 for decode)
+        assert self.fa_impl_ver in [3], "Only FA3 support decoding"
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -1134,8 +1106,8 @@ class FlashAttentionBackend(AttentionBackend):
 
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
         kwargs = {}
-        # HACK: For decode, always use FA3 (even if fa_impl_ver is 4)
-        # Don't set ver in kwargs, let it default to 3 for decode
+        if self.fa_impl_ver != 3:
+            kwargs["ver"] = self.fa_impl_ver
         if sinks is not None:
             kwargs["sinks"] = sinks
 
@@ -1143,7 +1115,6 @@ class FlashAttentionBackend(AttentionBackend):
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
         # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
-        # NOTE: For decode, we always use FA3 which supports FP8, so no need to check fa_impl_ver
         if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)

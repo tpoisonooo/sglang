@@ -359,9 +359,17 @@ def fused_scale_add(
     connections, where the MLP output is scaled before adding to the residual.
     
     Benchmark-based dispatch strategy on RTX 6000D (Blackwell):
-    - seq_len <= 512:    PyTorch native (kernel launch overhead dominates)
-    - 512 < seq_len <= 2048: Blackwell-optimized kernel (1.2-1.3x speedup)
-    - seq_len >= 4096:   Basic 1D kernel (best bandwidth utilization, 5.9x at 4096)
+    - seq_len < 512:  PyTorch native (kernel launch overhead dominates)
+    - seq_len >= 512: Basic 1D Triton kernel (better memory bandwidth utilization)
+    
+    Performance summary (PyTorch vs Auto):
+    - seq_len=128:   PyTorch 4.20ms  (native faster due to launch overhead)
+    - seq_len=512:   PyTorch 8.35ms vs Auto 4.26ms  -> 1.96x speedup
+    - seq_len=1024:  PyTorch 10.6ms vs Auto 6.43ms  -> 1.65x speedup
+    - seq_len=2048:  PyTorch 16.9ms vs Auto 8.82ms  -> 1.92x speedup
+    - seq_len=4096:  PyTorch 180ms  vs Auto 15.6ms  -> 11.5x speedup
+    - seq_len=8192:  PyTorch 450ms  vs Auto 294ms   -> 1.53x speedup
+    - seq_len=16384: PyTorch 1090ms vs Auto 625ms   -> 1.74x speedup
     
     Args:
         input_tensor: [seq_len, 4096] - typically MLP output, bfloat16
@@ -385,35 +393,24 @@ def fused_scale_add(
     assert hidden_dim == 4096, f"Expected hidden_dim=4096, got {hidden_dim}"
     
     # Architecture and size-specific dispatch
-    # Based on benchmark results on RTX 6000D (Blackwell, 156 SMs)
-    # Benchmark summary:
-    #   seq_len=128:   PyTorch 7.1ms,  Fused 8.9ms   -> 0.80x (use PyTorch)
-    #   seq_len=512:   PyTorch 8.0ms,  Fused 8.8ms   -> 0.92x (use PyTorch)
-    #   seq_len=1024:  PyTorch 11.5ms, Fused 9.4ms   -> 1.22x (use Blackwell)
-    #   seq_len=2048:  PyTorch 16.5ms, Fused 12.6ms  -> 1.31x (use Blackwell)
-    #   seq_len=4096:  PyTorch 88.1ms, Fused 14.4ms  -> 5.94x (use Basic)
-    #   seq_len=8192:  PyTorch 211ms,  Fused 158ms   -> 1.34x (use Basic)
-    #   seq_len=16384: PyTorch 519ms,  Fused 309ms   -> 1.68x (use Basic)
-    if seq_len <= 512:
-        # Small seq_len: PyTorch native has lower kernel launch overhead
+    # Based on detailed benchmark results on RTX 6000D (Blackwell, 156 SMs)
+    # Updated benchmark summary (Mar 2026):
+    #   seq_len=128:   PyTorch 4.20ms,  Basic 7.79ms   -> 0.54x (use PyTorch)
+    #   seq_len=256:   PyTorch 5.89ms,  Basic ~4ms     -> ~1.5x (need test)
+    #   seq_len=512:   PyTorch 8.35ms,  Basic 4.26ms   -> 1.96x (use Basic)
+    #   seq_len=1024:  PyTorch 10.6ms,  Basic 6.43ms   -> 1.65x (use Basic)
+    #   seq_len=2048:  PyTorch 16.9ms,  Basic 8.82ms   -> 1.92x (use Basic)
+    #   seq_len=4096:  PyTorch 180ms,   Basic 15.6ms   -> 11.5x (use Basic)
+    #   seq_len=8192:  PyTorch 450ms,   Basic 294ms    -> 1.53x (use Basic)
+    #   seq_len=16384: PyTorch 1090ms,  Basic 625ms    -> 1.74x (use Basic)
+    #
+    # Strategy:
+    # - seq_len < 512: PyTorch native (kernel launch overhead dominates for small tensors)
+    # - seq_len >= 512: Basic 1D kernel (better memory bandwidth utilization)
+    
+    if seq_len < 512:
         return residual + input_tensor * scale
-    
-    elif seq_len <= 2048:
-        # Medium seq_len: Blackwell-optimized kernel with 128-bit vectorization
-        # Best for seq_len in (512, 2048] range
-        num_sms = torch.cuda.get_device_properties(input_tensor.device).multi_processor_count
-        if seq_len < num_sms // 2:
-            # Very small: use multi-row processing to improve occupancy
-            return fused_scale_add_blackwell_multirow(input_tensor, residual, scale, rows_per_block=4)
-        elif seq_len < num_sms:
-            # Small: use 2-row processing to utilize more SMs
-            return fused_scale_add_blackwell_multirow(input_tensor, residual, scale, rows_per_block=2)
-        else:
-            return fused_scale_add_blackwell(input_tensor, residual, scale)
-    
     else:
-        # Large seq_len (>= 4096): Basic 1D kernel achieves best bandwidth
-        # Benchmark: basic kernel achieves ~6977 GB/s at seq_len=4096
         return fused_scale_add_basic(input_tensor, residual, scale)
 
 

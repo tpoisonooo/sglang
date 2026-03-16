@@ -9,7 +9,7 @@ from gptqmodel import QuantizeConfig, GPTQModel
 # from gptqmodel.models import MODEL_MAP
 # from gptqmodel.models.base import BaseQModel
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # import torch
 # torch.set_float32_matmul_precision('medium')  # 允许 TF32，略快略省内存

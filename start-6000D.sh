@@ -25,6 +25,20 @@ python3 -m sglang.launch_server \
     --max-running-requests 32 \
     --tp-size 1
 
+
+python3 -m sglang.launch_server \
+    --model /data/share/MiniCPM-SALA-int4 \
+    --host "0.0.0.0"  \
+    --trust-remote-code \
+    --port 30000 \
+    --disable-radix-cache \
+    --prefill-attention-backend fa4 \
+    --decode-attention-backend flashinfer \
+    --chunked-prefill-size 32768 --skip-server-warmup --dense-as-sparse \
+    --max-running-requests 32 \
+    --tp-size 1 \
+    --kv-cache-dtype fp8_e4m3
+
 python3 -m sglang.launch_server \
     --model /root/models/openbmb/MiniCPM-SALA \
     --host "0.0.0.0"  \
