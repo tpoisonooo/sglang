@@ -268,3 +268,4 @@ timecost
 submit/perf_public_set.jsonl
 submit/gptqmodel_offload/
 gptqmodel_offload/
+3rdparty/

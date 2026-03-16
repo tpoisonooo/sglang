@@ -708,6 +708,8 @@ class MiniCPMSALAForCausalLM(nn.Module):
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
+
+                    # print(param_name, param)
                     weight_loader(param, loaded_weight)
 
 EntryClass = [MiniCPMSALAForCausalLM]

@@ -3,41 +3,17 @@ from anyio import Path
 import pandas as pd
 import argparse
 
+# 现在导入 GPTQModel
 from gptqmodel import QuantizeConfig, GPTQModel
-from gptqmodel.models.base import BaseQModel
-from gptqmodel.models import MODEL_MAP
-# import pdb; pdb.set_trace()
+# 先导入 MODEL_MAP 并注册 MiniCPMSALAQModel，然后再导入 GPTQModel
+# from gptqmodel.models import MODEL_MAP
+# from gptqmodel.models.base import BaseQModel
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # import torch
 # torch.set_float32_matmul_precision('medium')  # 允许 TF32，略快略省内存
 
-class MiniCPMSALAQModel(BaseQModel):
-    """
-    MiniCPM SALA (Sparse Attention with Linear Attention) model support.
-    
-    This model supports two mixer types:
-    1. minicpm4: Standard attention with optional output gate (o_gate)
-    2. lightning: Lightning attention with output gate (z_proj)
-    
-    Note: z_proj is not quantized as per the original model design.
-    """
-    
-    pre_lm_head_norm_module = "model.norm"
-    layer_modules_strict = False  # 允许动态模块
-
-    # Module tree for MiniCPM SALA model
-
-    module_tree = [
-        'model', 
-        'layers', 
-        '#', 
-        {
-            'mlp': ('gate_proj', 'up_proj', 'down_proj'), 
-            'self_attn': ('q_proj', 'k_proj', 'v_proj', 'o_proj', 'o_gate', 'z_proj')
-        }
-    ]
 
 # 每次调整 量化的 layer 后，需要改动：
 # 1. minicpm.py  里的 opr 的quant参数
@@ -72,7 +48,7 @@ class MiniCPMSALAQModel(BaseQModel):
   }
 }
 """
-# 20260311 中午提交
+# 20260313 中午提交
 """
 {
   "acc": 98.81,
@@ -93,8 +69,6 @@ class MiniCPMSALAQModel(BaseQModel):
 # GT + common + math + fp8_kvcache 模型在 /workspace-moredata (加 common data 到底是否有效？)  76.67%
 # GT + common + math + fp8_kvcache + 首尾 g128 模型在 /data/share/minicpm   78.64%
 # GT + common + math + fp8_kvcache + 首尾 g128 + 放弃 downgate   76.18%
-
-MODEL_MAP['minicpm_sala'] = MiniCPMSALAQModel
 
 def load_q_dataset():
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -121,7 +95,7 @@ def main():
     quant_path = args.output
 
     quant_config = QuantizeConfig(bits=4, group_size=128, dynamic={
-            # 跳过第一层 (layers.0) 和最后一层 (layers.31)
+            # 跳过第一层和最后一层 
             '+:model\\.model\\.layers\\.0\\..*': {'bits': 8},
             '+:model\\.model\\.layers\\.31\\..*': {'bits': 8},
 
