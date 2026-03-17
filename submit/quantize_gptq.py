@@ -48,7 +48,7 @@ from gptqmodel import QuantizeConfig, GPTQModel
   }
 }
 """
-# 20260313 中午提交
+# 20260314 中午提交
 """
 {
   "acc": 98.81,

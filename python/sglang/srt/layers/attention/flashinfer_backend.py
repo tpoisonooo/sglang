@@ -32,6 +32,13 @@ from sglang.srt.utils import (
     next_power_of_2,
 )
 
+# Import FA4 support
+try:
+    from sgl_kernel.flash_attn import flash_attn_varlen_func
+    FA4_AVAILABLE = True
+except ImportError:
+    FA4_AVAILABLE = False
+
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -294,6 +301,19 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
+        
+        # Store page_size for FA4
+        self.page_size = model_runner.page_size
+
+        # FA4 prefill configuration - enabled via environment variable
+        self.use_fa4_prefill = True
+       # self.use_fa4_prefill = (
+       #     os.environ.get("SGLANG_FLASHINFER_USE_FA4_PREFILL", "0") == "1"
+       #     and FA4_AVAILABLE
+       #     and is_sm100_supported()
+       # )
+        if self.use_fa4_prefill:
+            logger.info("Using FA4 for prefill phase in FlashInfer backend")
 
     def _process_multi_item_scoring(
         self, forward_batch: ForwardBatch
@@ -761,6 +781,13 @@ class FlashInferAttnBackend(AttentionBackend):
         logits_soft_cap = layer.logit_cap
 
         q = q.contiguous()
+        
+        # Use FA4 for prefill if enabled
+        if self.use_fa4_prefill and not self.forward_metadata.use_ragged:
+            return self._forward_extend_fa4(
+                q, k, v, layer, forward_batch, save_kv_cache, cache_loc
+            )
+        
         if not self.forward_metadata.use_ragged:
             if k is not None:
                 assert v is not None
@@ -847,6 +874,118 @@ class FlashInferAttnBackend(AttentionBackend):
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
+    def _forward_extend_fa4(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool,
+        cache_loc: torch.Tensor,
+    ):
+        """
+        FA4-based prefill implementation for flashinfer backend.
+        Handles FP8 KV cache by converting to bf16 for FA4 computation.
+        """
+        # Save KV cache if needed (new tokens k, v)
+        if k is not None:
+            assert v is not None
+            if save_kv_cache:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                )
+
+        # Get KV cache buffer (cached tokens)
+        kv_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        
+        # kv_buffer is a tuple of (key_cache, value_cache)
+        if isinstance(kv_buffer, tuple):
+            key_cache, value_cache = kv_buffer
+        else:
+            # For fused kv cache case
+            key_cache = kv_buffer
+            value_cache = None
+
+        # Handle FP8 KV cache - convert to bf16 for FA4
+        fp8_dtypes = []
+        if hasattr(torch, 'float8_e4m3fn'):
+            fp8_dtypes.append(torch.float8_e4m3fn)
+        if hasattr(torch, 'float8_e5m2'):
+            fp8_dtypes.append(torch.float8_e5m2)
+        
+        if key_cache.dtype in fp8_dtypes:
+            # Convert FP8 to bf16 for FA4 computation
+            if layer.k_scale is not None and layer.v_scale is not None:
+                key_cache_fa = key_cache.to(torch.bfloat16) * layer.k_scale
+                value_cache_fa = value_cache.to(torch.bfloat16) * layer.v_scale
+            else:
+                key_cache_fa = key_cache.to(torch.bfloat16)
+                value_cache_fa = value_cache.to(torch.bfloat16) if value_cache is not None else None
+        else:
+            key_cache_fa = key_cache
+            value_cache_fa = value_cache
+
+        # Get metadata from forward_batch
+        seq_lens = forward_batch.seq_lens
+        extend_seq_lens = forward_batch.extend_seq_lens
+        
+        # Build cu_seqlens for varlen attention
+        cu_seqlens_q = torch.nn.functional.pad(
+            torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
+        )
+        cu_seqlens_k = torch.nn.functional.pad(
+            torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
+        )
+        
+        # Get max sequence lengths
+        max_seqlen_q = extend_seq_lens.max().item() if extend_seq_lens.numel() > 0 else 0
+        max_seqlen_k = seq_lens.max().item() if seq_lens.numel() > 0 else 0
+        
+        # Build page table from req_to_token_pool
+        max_seq_len_k = seq_lens.max().item()
+        page_table = forward_batch.req_to_token_pool.req_to_token[
+            forward_batch.req_pool_indices, :max_seq_len_k
+        ]
+        
+        # Prepare window size for FA4 (None means no window)
+        window_left = layer.sliding_window_size
+        if window_left is not None and window_left > 0:
+            window_size = (window_left, 0)  # (left, right) - causal uses 0 for right
+        else:
+            window_size = (None, None)  # No sliding window
+
+        # Reshape q for FA4: (total_tokens, num_heads, head_dim)
+        q_reshaped = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+        
+        # Reshape KV cache for FA4 paged format: (num_pages, page_size, num_heads, head_dim)
+        # key_cache_fa shape: [total_size, head_num, head_dim]
+        k_cache_reshaped = key_cache_fa.view(
+            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+        )
+        v_cache_reshaped = value_cache_fa.view(
+            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+        )
+
+        # Call FA4 using flash_attn_varlen_func
+        o = flash_attn_varlen_func(
+            q=q_reshaped,
+            k=k_cache_reshaped,
+            v=v_cache_reshaped,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            page_table=page_table,
+            softmax_scale=layer.scaling,
+            causal=not layer.is_cross_attention,
+            window_size=window_size,
+            softcap=layer.logit_cap,
+            ver=4,  # Use FA4
+        )
+
+        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -856,9 +995,6 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        decode_wrapper = self.forward_metadata.decode_wrappers[
-            self._get_wrapper_idx(layer)
-        ]
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -872,6 +1008,16 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
+        # Use FA4 for decode if enabled
+        if self.use_fa4_prefill:  # Reuse the same flag for decode as well
+            return self._forward_decode_fa4(
+                q, layer, forward_batch
+            )
+
+        decode_wrapper = self.forward_metadata.decode_wrappers[
+            self._get_wrapper_idx(layer)
+        ]
+
         # Call the wrapped function
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -881,6 +1027,133 @@ class FlashInferAttnBackend(AttentionBackend):
             # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
             k_scale=layer.k_scale_float,
             v_scale=layer.v_scale_float,
+        )
+
+        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def _forward_decode_fa4(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ):
+        """
+        FA4-based decode implementation for flashinfer backend.
+        Handles FP8 KV cache by converting to bf16 for FA4 computation.
+        """
+        # FA4 on SM10/12 only supports page_size=128
+        if self.page_size != 128:
+            # Fall back to standard decode wrapper
+            decode_wrapper = self.forward_metadata.decode_wrappers[
+                self._get_wrapper_idx(layer)
+            ]
+            o = decode_wrapper.forward(
+                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+            return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        
+        # Get KV cache buffer
+        kv_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        
+        # kv_buffer is a tuple of (key_cache, value_cache)
+        if isinstance(kv_buffer, tuple):
+            key_cache, value_cache = kv_buffer
+        else:
+            key_cache = kv_buffer
+            value_cache = None
+
+        # Handle FP8 KV cache - convert to bf16 for FA4
+        # Use sequential conversion to avoid memory spike from holding both FP8 and BF16 caches simultaneously
+        fp8_dtypes = []
+        if hasattr(torch, 'float8_e4m3fn'):
+            fp8_dtypes.append(torch.float8_e4m3fn)
+        if hasattr(torch, 'float8_e5m2'):
+            fp8_dtypes.append(torch.float8_e5m2)
+        
+        if key_cache.dtype in fp8_dtypes:
+            # Convert key_cache first
+            if layer.k_scale is not None:
+                key_cache_fa = key_cache.to(torch.bfloat16) * layer.k_scale
+            else:
+                key_cache_fa = key_cache.to(torch.bfloat16)
+            
+            # Convert value_cache, release key_cache reference to reduce memory pressure
+            if value_cache is not None:
+                if layer.v_scale is not None:
+                    value_cache_fa = value_cache.to(torch.bfloat16) * layer.v_scale
+                else:
+                    value_cache_fa = value_cache.to(torch.bfloat16)
+            else:
+                value_cache_fa = None
+            
+            # Explicitly delete original references to free memory before FA4 computation
+            del key_cache, value_cache
+            torch.cuda.empty_cache()
+        else:
+            key_cache_fa = key_cache
+            value_cache_fa = value_cache
+
+        # Get metadata for decode
+        seq_lens = forward_batch.seq_lens  # Current sequence lengths (including the new token)
+        batch_size = forward_batch.batch_size
+        
+        # For decode, q has shape [batch_size, 1, num_heads, head_dim] or [batch_size, num_heads, head_dim]
+        # We need to reshape it to [batch_size, num_heads, head_dim]
+        if q.dim() == 4:
+            q_reshaped = q.view(batch_size, layer.tp_q_head_num, layer.head_dim)
+        else:
+            q_reshaped = q.view(batch_size, layer.tp_q_head_num, layer.head_dim)
+
+        # Build cu_seqlens_q for decode (each query has length 1)
+        cu_seqlens_q = torch.arange(
+            0, batch_size + 1, dtype=torch.int32, device=q.device
+        )
+        
+        # seq_lens is the KV cache lengths
+        cache_seqlens = seq_lens.to(torch.int32)
+        
+        # Build page table
+        max_seq_len = seq_lens.max().item()
+        page_table = forward_batch.req_to_token_pool.req_to_token[
+            forward_batch.req_pool_indices, :max_seq_len
+        ]
+        
+        # Prepare window size
+        window_left = layer.sliding_window_size
+        if window_left is not None and window_left > 0:
+            window_size = (window_left, 0)
+        else:
+            window_size = (None, None)
+
+        # Reshape KV cache for FA4 paged format
+        k_cache_reshaped = key_cache_fa.view(
+            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+        )
+        v_cache_reshaped = value_cache_fa.view(
+            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+        )
+
+        # Call FA4
+        o = flash_attn_varlen_func(
+            q=q_reshaped,
+            k=k_cache_reshaped,
+            v=v_cache_reshaped,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=None,  # Not used for paged attention
+            seqused_k=cache_seqlens,  # For decode, pass seqused_k instead of cu_seqlens_k
+            max_seqlen_q=1,  # Each query has length 1 for decode
+            max_seqlen_k=max_seq_len,
+            page_table=page_table,
+            softmax_scale=layer.scaling,
+            causal=True,  # Decode is always causal
+            window_size=window_size,
+            softcap=layer.logit_cap,
+            ver=4,  # Use FA4
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)

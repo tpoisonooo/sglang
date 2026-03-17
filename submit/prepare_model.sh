@@ -35,8 +35,8 @@ echo "[prepare_model] Output: ${OUTPUT_PATH}"
 export HF_ENDPOINT=https://hf-mirror.com
 
 # 期望的 MD5 校验值
-EXPECTED_MD5_1="5820dd4be58042e10697defe42719d4c"
-EXPECTED_MD5_2="66265791d93952a94cbef09c8928e194"
+EXPECTED_MD5_1="c873d39fc585131c02e42b4b9f3048f7"
+EXPECTED_MD5_2="e73d7784bc5f8f37223a18a791575942"
 
 # 下载函数，带重试机制
 download_with_retry() {
@@ -52,7 +52,7 @@ download_with_retry() {
             rm -rf "$local_dir"
         fi
         
-        if huggingface-cli download tpoisonooo/test03152 --local-dir "$local_dir"; then
+        if huggingface-cli download tpoisonooo/test0317 --local-dir "$local_dir"; then
             echo "[prepare_model] Download completed successfully."
             return 0
         else

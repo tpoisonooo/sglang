@@ -1,16 +1,13 @@
 ## 当前 WIP 优化
 
-1. 启用 FA4
-
-Average Score: 75.09%
-Total Duration: 1970.01 s
-Total Tokens: In=8644166, Out=1862730
-Average Tokens/Sample: In=57627.8, Out=12418.2
-Overall TPS (Output): 945.55 tokens/s
-Detailed results saved to outputs/20260314_192209/predictions.jsonl
-
-启用前：
-- 原始 895 tokens/s
+1. 原始 fa + scale_add fused 
+Average Score: 77.89%
+Total Duration: 2705.45 s
+Total Tokens: In=8644166, Out=996649
+Average Tokens/Sample: In=57627.8, Out=6644.3
+Overall TPS (Output): 368.39 tokens/s
+Detailed results saved to outputs/20260317_034349/predictions.jsonl
 
 
-2. 31 层保持量化
+2. fa4 prefill （确认生效）+ fa decode + chunk GLA
+
