@@ -26,4 +26,3 @@ fi
 
 export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --trust-remote-code --attention-backend flashinfer --kv-cache-dtype fp8_e4m3"
 export HF_ENDPOINT=https://hf-mirror.com
-

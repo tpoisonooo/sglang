@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Inference-only MiniCPM model compatible with HuggingFace weights."""
+import pdb
 import math
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -82,9 +83,20 @@ class MiniCPMMLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
+        import time
+        t0 = time.perf_counter()
+        print(f"[MiniCPMMLP] input shape: {x.shape}, dtype: {x.dtype}, device: {x.device}")
         gate_up, _ = self.gate_up_proj(x)
+        t1 = time.perf_counter()
+        print(f"[MiniCPMMLP] gate_up_proj: {x.shape} -> {gate_up.shape}, time: {(t1-t0)*1000:.3f}ms")
         x = self.act_fn(gate_up)
+        t2 = time.perf_counter()
+        print(f"[MiniCPMMLP] act_fn (SiluAndMul): {gate_up.shape} -> {x.shape}, time: {(t2-t1)*1000:.3f}ms")
         x, _ = self.down_proj(x)
+        t3 = time.perf_counter()
+        print(f"[MiniCPMMLP] down_proj: {gate_up.shape} -> {x.shape}, time: {(t3-t2)*1000:.3f}ms")
+        print(f"[MiniCPMMLP] output shape: {x.shape}, total: {(t3-t0)*1000:.3f}ms")
+        print(f"[MiniCPMMLP] compute: Linear(hidden->{gate_up.shape[-1]}) -> SiLU+Mul -> Linear({gate_up.shape[-1]}->hidden)")
         return x
 
 
@@ -180,23 +192,46 @@ class MiniCPMAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        import time
+        t0 = time.perf_counter()
+        print(f"[MiniCPMAttention] input shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
+        print(f"[MiniCPMAttention] positions shape: {positions.shape}")
+        
         qkv, _ = self.qkv_proj(hidden_states)
+        t1 = time.perf_counter()
+        print(f"[MiniCPMAttention] qkv_proj: {hidden_states.shape} -> {qkv.shape}, time: {(t1-t0)*1000:.3f}ms")
+        
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        print(f"[MiniCPMAttention] split qkv: q={q.shape}, k={k.shape}, v={v.shape}")
 
         if self.attn_use_rope:
+            t_rope0 = time.perf_counter()
             orig_dtype = q.dtype
             q, k = q.float(), k.float()
             q, k = self.rotary_emb(positions, q, k)
             q, k = q.to(orig_dtype), k.to(orig_dtype)
+            t_rope1 = time.perf_counter()
+            print(f"[MiniCPMAttention] rotary_emb: time: {(t_rope1-t_rope0)*1000:.3f}ms")
 
+        t_attn0 = time.perf_counter()
         attn_output = self.attn(q, k, v, forward_batch)
+        t_attn1 = time.perf_counter()
+        print(f"[MiniCPMAttention] RadixAttention: time: {(t_attn1-t_attn0)*1000:.3f}ms")
 
         if self.use_output_gate:
+            t_gate0 = time.perf_counter()
             o_gate_output, _ = self.o_gate(hidden_states)
             attn_output = attn_output * F.sigmoid(o_gate_output)
+            t_gate1 = time.perf_counter()
+            print(f"[MiniCPMAttention] output_gate: time: {(t_gate1-t_gate0)*1000:.3f}ms")
 
         output, _ = self.o_proj(attn_output)
+        t2 = time.perf_counter()
+        print(f"[MiniCPMAttention] o_proj: {attn_output.shape} -> {output.shape}, time: {(t2-t_attn1)*1000:.3f}ms")
+        print(f"[MiniCPMAttention] output shape: {output.shape}, total: {(t2-t0)*1000:.3f}ms")
+        print(f"[MiniCPMAttention] compute: Linear(hidden->qkv) -> RoPE -> Attention(num_heads={self.num_heads}, head_dim={self.head_dim}) -> Linear")
         return output
+
 
 
 class MiniCPMLightningMixer(nn.Module):
@@ -285,17 +320,16 @@ class MiniCPMLightningMixer(nn.Module):
             self.o_norm = RMSNorm(self.num_heads * self.head_dim, eps=self.rms_norm_eps)
 
         if self.use_output_gate:
-            # Note: z_proj is not quantized in the checkpoint, so we don't pass quant_config
             self.z_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.total_num_heads * self.head_dim,
                 bias=self.attention_bias,
-                quant_config=None,  # z_proj is not quantized
-                # quant_config=quant_config,
+                quant_config=quant_config,
                 prefix=add_prefix("z_proj", prefix),
             )
 
         if self.qk_norm:
+            # Keep original norms for weight loading compatibility
             self.q_norm = RMSNorm(self.head_dim, eps=self.rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=self.rms_norm_eps)
 
@@ -317,47 +351,55 @@ class MiniCPMLightningMixer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        import time
+        t0 = time.perf_counter()
+        print(f"[MiniCPMLightningMixer] input shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
+        print(f"[MiniCPMLightningMixer] positions shape: {positions.shape}")
+        print(f"[MiniCPMLightningMixer] layer_id={self.layer_id}, num_heads={self.num_heads}, head_dim={self.head_dim}")
         
         qkv, _ = self.qkv_proj(hidden_states)  # [seq_len, hidden_size] -> [seq_len, q_size+kv_size+kv_size]
+        t1 = time.perf_counter()
+        print(f"[MiniCPMLightningMixer] qkv_proj: {hidden_states.shape} -> {qkv.shape}, time: {(t1-t0)*1000:.3f}ms")
+        
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        print(f"[MiniCPMLightningMixer] split: q={q.shape}, k={k.shape}, v={v.shape}")
 
-        # print(f'fused_rms_rope shape {q.shape}, {k.shape}, {self.num_heads}, {self.head_dim}, {self.num_kv_heads}')
+        if not self.qk_norm or not self.use_rope:
+            pdb.set_trace()
+            print('not qk_norm or not use_rope')
+            pass
 
-        # if self.qk_norm and self.use_rope:
+        # Use fused RMSNorm + RoPE kernel
+        # Get cos_sin_cache from rotary_emb (already in FP32)
+        t_fused0 = time.perf_counter()
+        cos_sin_cache = self.rotary_emb.cos_sin_cache  # [max_position, head_dim * 2]
         q, k = fused_rms_norm_rope(
             q=q,
             k=k,
             positions=positions,
+            cos_sin_cache=cos_sin_cache,
             q_norm_weight=self.q_norm.weight,
             k_norm_weight=self.k_norm.weight,
-            cos_sin_cache=self.rotary_emb.cos_sin_cache, # [max_position, head_dim * 2]
             eps=self.rms_norm_eps,
         )
+        t_fused1 = time.perf_counter()
+        print(f"[MiniCPMLightningMixer] fused_rms_norm_rope: time: {(t_fused1-t_fused0)*1000:.3f}ms")
+        # else:
+        # if True:
+            # Fallback to original implementation
+            # q = self.q_norm(q.contiguous().view(-1, self.head_dim))
+            # k = self.k_norm(k.contiguous().view(-1, self.head_dim))
+            # q = q.view(-1, self.num_heads * self.head_dim)
+            # k = k.view(-1, self.num_kv_heads * self.head_dim)
+        
+            # orig_dtype = q.dtype
+            # q, k = q.float(), k.float()
+            # q, k = self.rotary_emb(positions, q, k)
+            # q = q.to(orig_dtype).view(1, -1, self.num_heads, self.head_dim).contiguous()
+            # k = k.to(orig_dtype).view(1, -1, self.num_kv_heads, self.head_dim).contiguous()
 
         v = v.reshape(1, -1, self.num_kv_heads, self.head_dim)
-        # else:
-        #     # ground truth start
-        #     if self.qk_norm:
-        #         q = self.q_norm(q.reshape(-1, self.head_dim))
-        #         k = self.k_norm(k.reshape(-1, self.head_dim))
-
-        #     if self.use_rope:
-        #         q = q.reshape(-1, self.num_heads * self.head_dim)
-        #         k = k.reshape(-1, self.num_kv_heads * self.head_dim)
-        #         orig_dtype = q.dtype
-        #         q, k = q.float(), k.float()
-        #         q, k = self.rotary_emb(positions, q, k)
-        #         q, k = q.to(orig_dtype), k.to(orig_dtype)
-
-        #     q = q.reshape(-1, self.num_heads, self.head_dim)
-        #     k = k.reshape(-1, self.num_kv_heads, self.head_dim)
-        #     v = v.reshape(-1, self.num_kv_heads, self.head_dim)
-
-        #     # ALWAYS unsqueeze to (1, total_tokens, h, d)
-        #     q = q.unsqueeze(0)  # (1, total_tokens, num_heads, head_dim)
-        #     k = k.unsqueeze(0)
-        #     v = v.unsqueeze(0)
-        #     # ground truth end
+        print(f"[MiniCPMLightningMixer] reshape for backend: q={q.shape}, k={k.shape}, v={v.shape}")
 
         # Get backend from forward batch
         attn_backend = forward_batch.attn_backend
@@ -377,6 +419,7 @@ class MiniCPMLightningMixer(nn.Module):
         # Prepare backend inputs
         # Backend expects q, k, v, forward_batch, layer_id
         # It will handle state loading/saving internally
+        t_backend0 = time.perf_counter()
         o = linear_attn_backend.forward(
             q=q,
             k=k,
@@ -385,28 +428,49 @@ class MiniCPMLightningMixer(nn.Module):
             layer_id=self.layer_id,
             output_attentions=False,
         )
-		
-        # if self.use_output_gate and self.use_output_norm:
+        t_backend1 = time.perf_counter()
+        print(f"[MiniCPMLightningMixer] SimpleGLAAttnBackend.forward: time: {(t_backend1-t_backend0)*1000:.3f}ms")
+
+        if not self.use_output_gate:
+            pdb.set_trace()
+            print('no output gate')
+            pass
+    
+        if not self.use_output_norm:
+            pdb.set_trace()
+            print('no output norm')
+            pass
+
         z, _ = self.z_proj(hidden_states)   # [seq_len, hidden_size] -> [seq_len, 4096]
+        t_z0 = time.perf_counter()
+        print(f"[MiniCPMLightningMixer] z_proj: time: {(t_z0-t_backend1)*1000:.3f}ms")
+
+        # o = o.reshape(-1, self.num_heads * self.head_dim)   # -> [142,4096]
+        # fusing start - use fused kernel
+        t_fused_out0 = time.perf_counter()
         o = fused_output_processing(
             o=o,
             z=z,
             norm_weight=self.o_norm.weight,
             eps=self.rms_norm_eps,
         )
+        t_fused_out1 = time.perf_counter()
+        print(f"[MiniCPMLightningMixer] fused_output_processing (o_norm + sigmoid gate): time: {(t_fused_out1-t_fused_out0)*1000:.3f}ms")
+        # fusing end
         # else:
-        #     o = o.reshape(-1, self.num_heads * self.head_dim)
-
-        #     if self.use_output_norm:
-        #         o = self.o_norm(o)
-
-        #     if self.use_output_gate:
-        #         z, _ = self.z_proj(hidden_states)
-        #         o = o * F.sigmoid(z)
-
+        # if True:
+            # fusing start
+            # o = self.o_norm(o)  # -> [142,4096]
+            # o = o * F.sigmoid(z)
+            # fusing end
+        # diff = o2 - o1
+        # pdb.set_trace()
         y, _ = self.o_proj(o)
+        t2 = time.perf_counter()
+        print(f"[MiniCPMLightningMixer] o_proj: {o.shape} -> {y.shape}, time: {(t2-t_fused_out1)*1000:.3f}ms")
+        print(f"[MiniCPMLightningMixer] output shape: {y.shape}, total: {(t2-t0)*1000:.3f}ms")
+        print(f"[MiniCPMLightningMixer] compute: Linear -> FusedRMSNorm+RoPE -> SimpleGLA -> FusedOutputNorm+Gate -> Linear")
         return y
-
 
 
 class MiniCPMDecoderLayer(nn.Module):
@@ -513,27 +577,56 @@ class MiniCPMDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        import time
+        t_layer0 = time.perf_counter()
+        print(f"\n[MiniCPMDecoderLayer {self.layer_id}] START input shape: {hidden_states.shape}, mixer_type={self.mixer_type}")
+        
         # Build sparse metadata (model-specific logic!)
 
         # Self Attention
+        t_attn0 = time.perf_counter()
         residual = hidden_states
+        print(f"[MiniCPMDecoderLayer {self.layer_id}] residual saved")
+        
+        t_norm0 = time.perf_counter()
         hidden_states = self.input_layernorm(hidden_states)
+        t_norm1 = time.perf_counter()
+        print(f"[MiniCPMDecoderLayer {self.layer_id}] input_layernorm: time: {(t_norm1-t_norm0)*1000:.3f}ms")
+        
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-
-        # hidden_states = residual + hidden_states * self.hidden_scale
+        t_attn1 = time.perf_counter()
+        print(f"[MiniCPMDecoderLayer {self.layer_id}] self_attn total: {(t_attn1-t_attn0)*1000:.3f}ms")
+        
+        t_fused0 = time.perf_counter()
         hidden_states = fused_scale_add(hidden_states, residual, self.hidden_scale)
+        t_fused1 = time.perf_counter()
+        print(f"[MiniCPMDecoderLayer {self.layer_id}] fused_scale_add (residual + attn_out * {self.hidden_scale:.4f}): time: {(t_fused1-t_fused0)*1000:.3f}ms")
         
         # Fully Connected
+        t_mlp0 = time.perf_counter()
         residual = hidden_states
+        print(f"[MiniCPMDecoderLayer {self.layer_id}] residual saved for MLP")
+        
+        t_norm2 = time.perf_counter()
         hidden_states = self.post_attention_layernorm(hidden_states)
+        t_norm3 = time.perf_counter()
+        print(f"[MiniCPMDecoderLayer {self.layer_id}] post_attention_layernorm: time: {(t_norm3-t_norm2)*1000:.3f}ms")
+        
         hidden_states = self.mlp(hidden_states)
-
-        # hidden_states = residual + hidden_states * self.hidden_scale
+        t_mlp1 = time.perf_counter()
+        print(f"[MiniCPMDecoderLayer {self.layer_id}] mlp total: {(t_mlp1-t_norm3)*1000:.3f}ms")
+        
+        t_fused2 = time.perf_counter()
         hidden_states = fused_scale_add(hidden_states, residual, self.hidden_scale)
+        t_fused3 = time.perf_counter()
+        print(f"[MiniCPMDecoderLayer {self.layer_id}] fused_scale_add (residual + mlp_out * {self.hidden_scale:.4f}): time: {(t_fused3-t_fused2)*1000:.3f}ms")
+        
+        t_layer1 = time.perf_counter()
+        print(f"[MiniCPMDecoderLayer {self.layer_id}] END output shape: {hidden_states.shape}, layer total: {(t_layer1-t_layer0)*1000:.3f}ms")
 
         return hidden_states, None
 
@@ -575,13 +668,28 @@ class MiniCPMModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        import time
+        t0 = time.perf_counter()
+        print(f"\n{'='*80}")
+        print(f"[MiniCPMModel] START forward")
+        print(f"[MiniCPMModel] input_ids shape: {input_ids.shape}, dtype: {input_ids.dtype}")
+        print(f"[MiniCPMModel] positions shape: {positions.shape}")
+        
+        t_embed0 = time.perf_counter()
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids) * self.config.scale_emb
+            print(f"[MiniCPMModel] embed_tokens + scale({self.config.scale_emb})")
         else:
             hidden_states = input_embeds
+            print(f"[MiniCPMModel] using input_embeds")
+        t_embed1 = time.perf_counter()
+        print(f"[MiniCPMModel] embedding: {input_ids.shape} -> {hidden_states.shape}, time: {(t_embed1-t_embed0)*1000:.3f}ms")
+        
         residual = None
+        num_layers = len(self.layers)
+        print(f"[MiniCPMModel] num_layers: {num_layers}")
 
-        for i in range(len(self.layers)):
+        for i in range(num_layers):
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -589,7 +697,15 @@ class MiniCPMModel(nn.Module):
                 forward_batch,
                 residual,
             )
+        
+        t_norm0 = time.perf_counter()
         hidden_states = self.norm(hidden_states)
+        t_norm1 = time.perf_counter()
+        print(f"[MiniCPMModel] final norm: time: {(t_norm1-t_norm0)*1000:.3f}ms")
+        
+        t1 = time.perf_counter()
+        print(f"[MiniCPMModel] END output shape: {hidden_states.shape}, total: {(t1-t0)*1000:.3f}ms")
+        print(f"{'='*80}\n")
         return hidden_states
 
 
@@ -629,15 +745,42 @@ class MiniCPMSALAForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        import time
+        t0 = time.perf_counter()
+        print(f"\n{'#'*80}")
+        print(f"[MiniCPMSALAForCausalLM] START forward")
+        print(f"[MiniCPMSALAForCausalLM] input_ids: {input_ids.shape}, positions: {positions.shape}")
+        
         if input_embeds is not None:
             input_embeds = input_embeds * self.config.scale_emb
+            print(f"[MiniCPMSALAForCausalLM] scaled input_embeds")
+
+        t_model0 = time.perf_counter()
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        t_model1 = time.perf_counter()
+        print(f"[MiniCPMSALAForCausalLM] model forward: {(t_model1-t_model0)*1000:.3f}ms")
+        
+        t_scale0 = time.perf_counter()
         hidden_states = hidden_states / self.scale_width
+        t_scale1 = time.perf_counter()
+        print(f"[MiniCPMSALAForCausalLM] scale_width ({self.scale_width:.4f}): time: {(t_scale1-t_scale0)*1000:.3f}ms")
+        
         if self.config.tie_word_embeddings:
             lm_head = self.model.embed_tokens
+            print(f"[MiniCPMSALAForCausalLM] using embed_tokens as lm_head")
         else:
             lm_head = self.lm_head
-        return self.logits_processor(input_ids, hidden_states, lm_head, forward_batch)
+            print(f"[MiniCPMSALAForCausalLM] using lm_head")
+
+        t_logits0 = time.perf_counter()
+        result = self.logits_processor(input_ids, hidden_states, lm_head, forward_batch)
+        t_logits1 = time.perf_counter()
+        print(f"[MiniCPMSALAForCausalLM] logits_processor: time: {(t_logits1-t_logits0)*1000:.3f}ms")
+        
+        t1 = time.perf_counter()
+        print(f"[MiniCPMSALAForCausalLM] END total: {(t1-t0)*1000:.3f}ms")
+        print(f"{'#'*80}\n")
+        return result
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -695,21 +838,10 @@ class MiniCPMSALAForCausalLM(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
-
-                    # 在查找 params_dict 之前，处理 GPTQ 后缀
-                    if name.endswith(".weight") and name not in params_dict:
-                        # 尝试 GPTQ 命名
-                        gptq_name = name.replace(".weight", ".qweight")
-                        if gptq_name in params_dict:
-                            name = gptq_name
-                        # 如果检查点里存的是 scales/qzeros/g_idx，它们应该直接匹配
-     
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
-
-                    # print(param_name, param)
                     weight_loader(param, loaded_weight)
 
-EntryClass = [MiniCPMSALAForCausalLM]
+# EntryClass = [MiniCPMSALAForCausalLM]
