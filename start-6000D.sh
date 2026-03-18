@@ -167,3 +167,17 @@ python -m sglang.bench_one_batch --model-path /root/models/openbmb/MiniCPM-SALA 
     --attention-backend minicpm_flashinfer \
     --chunked-prefill-size 8192 --skip-server-warmup --dense-as-sparse \
     --tp-size 1
+
+
+python3 -m sglang.launch_server \
+    --model /root/models/openbmb/MiniCPM-SALA-int4 \
+    --host "0.0.0.0"  \
+    --trust-remote-code \
+    --port 30000 \
+    --disable-radix-cache \
+    --attention-backend minicpm_flashinfer \
+    --chunked-prefill-size 32768 --skip-server-warmup --dense-as-sparse \
+    --max-running-requests 32 \
+    --tp-size 1 \
+    --kv-cache-dtype fp8_e4m3 
+    

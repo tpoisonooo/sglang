@@ -1,3 +1,20 @@
+# 1. 配置显存分配策略（必须在 import 其他库前设置）
+import os
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+import torch
+
+# 2. 启用 TF32（不省显存但加速，间接减少峰值占用时间）
+torch.set_float32_matmul_precision('high')
+
+# 3. 启用 cudnn 优化（减少中间buffer）
+torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.enabled = True
+
+# 4. 启用垃圾回收（及时释放中间张量）
+import gc
+gc.collect()
+torch.cuda.empty_cache()  # 在关键节点手动清理
+
 import os
 from anyio import Path
 import pandas as pd
@@ -9,7 +26,27 @@ from gptqmodel import QuantizeConfig, GPTQModel
 # from gptqmodel.models import MODEL_MAP
 # from gptqmodel.models.base import BaseQModel
 
-# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import atexit
+import os
+import signal
+import sys
+
+def on_exit():
+    print(f"程序即将退出，PID: {os.getpid()}", flush=True)
+
+atexit.register(on_exit)
+
+def signal_handler(signum, frame):
+    print(f"收到信号 {signum} ({signal.Signals(signum).name})，正在退出...", flush=True)
+    sys.exit(1)
+
+for sig in [signal.SIGTERM, signal.SIGKILL, signal.SIGINT, signal.SIGSEGV]:
+    try:
+        signal.signal(sig, signal_handler)
+    except:
+        pass
+
+print("程序启动，开始监控...", flush=True)
 
 # import torch
 # torch.set_float32_matmul_precision('medium')  # 允许 TF32，略快略省内存
@@ -62,6 +99,20 @@ from gptqmodel import QuantizeConfig, GPTQModel
 }
 """
 
+# 20260317 晚上提交
+"""
+{
+  "acc": 98.97,
+  "acc_ori": 79.18,
+  "final_score": 73.7,
+  "benchmark_duration": {
+    "S1": 429.48,
+    "S8": 591.09,
+    "Smax": 1066.44
+  }
+}
+"""
+
 # o_gate 后面有 F.sigmoid 还好； down_proj 属于 MLP 最后一层，影响比较大。
 # GT 是  82.24%
 # GT + fp8_kvcache 80.31%
@@ -97,7 +148,7 @@ def main():
     quant_config = QuantizeConfig(bits=4, group_size=128, dynamic={
             # 跳过第一层和最后一层 
             '+:model\\.model\\.layers\\.0\\..*': {'bits': 8},
-            '+:model\\.model\\.layers\\.31\\..*': {'bits': 8},
+            # '+:model\\.model\\.layers\\.31\\..*': {'bits': 8},
 
             # o_gate 使用 8-bit（所有层）
             # r'+:model\.model\.layers\.\d+\.self_attn\.o_gate': {'bits': 8, 'group_size': 64},
