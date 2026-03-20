@@ -24,5 +24,5 @@ else
     echo "Warning: Could not find sgl_kernel path. FA4 patches not applied."
 fi
 
-export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --trust-remote-code --attention-backend flashinfer --kv-cache-dtype fp8_e4m3"
+export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --trust-remote-code --attention-backend flashinfer --quantization modelopt_fp4 --kv-cache-dtype fp8_e4m3 "
 export HF_ENDPOINT=https://hf-mirror.com

@@ -423,5 +423,109 @@ def main():
     print("=" * 110)
 
 
+# =============================================================================
+# Test from NPZ Debug Files
+# =============================================================================
+
+def test_from_npz_debug():
+    """Load and test from debug npz files saved by minicpm.py."""
+    import numpy as np
+    import glob
+    
+    DEBUG_DIR = "/root/soar2026/debug"
+    npz_files = sorted(glob.glob(os.path.join(DEBUG_DIR, "layer_*_debug.npz")))
+    
+    if not npz_files:
+        print(f"\nNo .npz files found in {DEBUG_DIR}")
+        return
+    
+    print("\n" + "=" * 100)
+    print("Testing Chunk GLA from NPZ Debug Files")
+    print("=" * 100)
+    print(f"Found {len(npz_files)} files to test")
+    print(f"{'File':<40} {'Shape':<20} {'vs FLA MAE':<15} {'vs FLA Max':<15} {'vs Ref MAE':<15} {'Status':<10}")
+    print("-" * 100)
+    
+    for npz_path in npz_files:
+        try:
+            # Load data
+            data = np.load(npz_path)
+            
+            # Convert to torch tensors
+            q = torch.from_numpy(data['q']).cuda().bfloat16()
+            k = torch.from_numpy(data['k']).cuda().bfloat16()
+            v = torch.from_numpy(data['v']).cuda().bfloat16()
+            z = torch.from_numpy(data['z']).cuda().bfloat16()
+            norm_weight = torch.from_numpy(data['norm_weight']).cuda().float()
+            o_ref = torch.from_numpy(data['o_ref']).cuda().bfloat16()
+            
+            # Optional parameters
+            scale = float(data['scale']) if 'scale' in data else (q.shape[-1] ** -0.5)
+            eps = float(data['eps']) if 'eps' in data else 1e-6
+            
+            g_gamma = None
+            if 'g_gamma' in data:
+                g_gamma_data = data['g_gamma']
+                if g_gamma_data.size > 0:
+                    g_gamma = torch.from_numpy(g_gamma_data).cuda().float()
+            
+            B, T, H, K = q.shape
+            V = v.shape[-1]
+            
+            # Run chunk GLA (autotuned)
+            out_chunk, _ = fla_fused_autotuned(
+                q, k, v, g_gamma, scale, z, norm_weight, eps=eps
+            )
+            
+            # Run FLA baseline for comparison
+            out_fla, _ = real_baseline_fla_4d(q, k, v, g_gamma, scale, z, norm_weight, eps=eps)
+            
+            # Compare with FLA (correctness check)
+            diff_fla = (out_chunk.float() - out_fla.float()).abs()
+            mae_fla = diff_fla.mean().item()
+            max_diff_fla = diff_fla.max().item()
+            
+            # Compare with saved reference
+            diff_ref = (out_chunk.float() - o_ref.float()).abs()
+            mae_ref = diff_ref.mean().item()
+            
+            # Status based on FLA comparison
+            if max_diff_fla > 0.1:
+                status = "FAIL"
+            elif max_diff_fla > 0.01:
+                status = "WARN"
+            else:
+                status = "PASS"
+            
+            filename = os.path.basename(npz_path)
+            shape_str = f"[{B},{T},{H},{V}]"
+            print(f"{filename:<40} {shape_str:<20} {mae_fla:<15.6f} {max_diff_fla:<15.6f} {mae_ref:<15.6f} {status}")
+            
+            # Detailed output for failed cases
+            if status in ["FAIL", "WARN"]:
+                print(f"  Details:")
+                print(f"    Chunk output mean: {out_chunk.float().mean().item():.6f}, std: {out_chunk.float().std().item():.6f}")
+                print(f"    FLA output mean: {out_fla.float().mean().item():.6f}, std: {out_fla.float().std().item():.6f}")
+                print(f"    Ref output mean: {o_ref.float().mean().item():.6f}, std: {o_ref.float().std().item():.6f}")
+                
+                # Find max diff location
+                max_idx = diff_fla.argmax().item()
+                print(f"    Max diff (vs FLA) location: {max_idx}")
+                print(f"    Chunk value at max: {out_chunk.flatten()[max_idx].item():.6f}")
+                print(f"    FLA value at max: {out_fla.flatten()[max_idx].item():.6f}")
+                
+        except Exception as e:
+            import traceback
+            filename = os.path.basename(npz_path)
+            print(f"{filename:<40} {'ERROR':<20} {'N/A':<15} {'N/A':<15} {'N/A':<15} {'ERROR'}")
+            print(f"  Error: {str(e)}")
+            traceback.print_exc()
+    
+    print("=" * 100)
+
+
 if __name__ == "__main__":
     main()
+    
+    # Also run NPZ debug tests
+    test_from_npz_debug()

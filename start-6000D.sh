@@ -180,4 +180,15 @@ python3 -m sglang.launch_server \
     --max-running-requests 32 \
     --tp-size 1 \
     --kv-cache-dtype fp8_e4m3 
-    
+
+python3 -m sglang.launch_server     --model /root/models/openbmb/MiniCPM-SALA-fp4     --host "0.0.0.0"      --trust-remote-code     --port 30000     --disable-radix-cache     --attention-backend flashinfer     --chunked-prefill-size 32768     --max-running-requests 32     --tp-size 1     --kv-cache-dtype fp8_e4m3 --quantization modelopt_fp4
+
+python3 -m sglang.launch_server     --model /root/models/openbmb/MiniCPM-SALA-fp4    --host "0.0.0.0"      --trust-remote-code     --port 30000     --disable-radix-cache     --attention-backend flashinfer     --chunked-prefill-size 32768     --max-running-requests 32     --tp-size 1     --kv-cache-dtype fp8_e4m3   --quantization modelopt_fp4 --mem-fraction-static 0.75
+
+
+python3 eval_model.py \
+  --api_base http://127.0.0.1:30000 \
+  --model_name /root/models/openbmb/MiniCPM-SALA-fp4 \
+  --data_path /root/perf_public_set.jsonl \
+  --concurrency 16
+

@@ -2465,7 +2465,7 @@ class ModelOptModelLoader(DefaultModelLoader):
             calib_dataloader = get_dataset_dataloader(
                 dataset_name="cnn_dailymail",  # TODO: Consider making this configurable
                 tokenizer=tokenizer,
-                batch_size=36,  # TODO: Consider making this configurable
+                batch_size=1,  # TODO: Consider making this configurable. Set to 1 for models requiring attention_mask when batch size > 1 (e.g., LightningAttention)
                 num_samples=512,  # TODO: Consider making this configurable
                 device=model.device,
                 include_labels=False,
@@ -2621,10 +2621,29 @@ class ModelOptModelLoader(DefaultModelLoader):
         try:
             # getattr will fetch the config object, e.g., mtq.FP8_DEFAULT_CFG
             quant_cfg = getattr(mtq, quant_cfg_name)
+            if callable(quant_cfg):
+                quant_cfg = quant_cfg()
         except AttributeError:
             raise AttributeError(
                 f"ModelOpt quantization config '{quant_cfg_name}' not found. "
                 "Please verify the ModelOpt library installation."
+            )
+
+        # Apply layer exclusion if configured (skip first/last layers for better accuracy)
+        skip_first_n = getattr(model_config, "modelopt_skip_first_n_layers", 0)
+        skip_last_n = getattr(model_config, "modelopt_skip_last_n_layers", 0)
+        if skip_first_n > 0 or skip_last_n > 0:
+            from sglang.srt.layers.modelopt_utils import create_layer_excluded_config
+            
+            num_layers = getattr(model.config, "num_hidden_layers", 32)
+            layer_prefix = getattr(model_config, "modelopt_layer_prefix", "model.layers")
+            
+            quant_cfg = create_layer_excluded_config(
+                quant_cfg,
+                num_layers=num_layers,
+                skip_first_n=skip_first_n,
+                skip_last_n=skip_last_n,
+                layer_prefix=layer_prefix,
             )
 
         logger.info(

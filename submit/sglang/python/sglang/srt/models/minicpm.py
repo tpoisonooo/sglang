@@ -29,8 +29,16 @@ from sglang.srt.layers.attention.minicpm_sparse_utils import (
     SparseMetadataBuilder,
 )
 from sglang.srt.models.minicpm_fused_norm_rope import fused_rms_norm_rope
+
 from sglang.srt.models.minicpm_fused_output import fused_output_processing
 from sglang.srt.models.minicpm_fused_scale_add import fused_scale_add
+
+import numpy as np
+import os
+
+# Create debug directory
+DEBUG_DIR = "/root/soar2026/debug"
+os.makedirs(DEBUG_DIR, exist_ok=True)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -51,6 +59,8 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
 
 class MiniCPMMLP(nn.Module):
+    """TP=1 OPTIMIZED: Simplified for single GPU"""
+    __slots__ = ['gate_up_proj', 'down_proj', 'act_fn']
     def __init__(
         self,
         hidden_size: int,
@@ -89,6 +99,10 @@ class MiniCPMMLP(nn.Module):
 
 
 class MiniCPMAttention(nn.Module):
+    """TP=1 OPTIMIZED: Simplified head calculation for single GPU"""
+    __slots__ = ['hidden_size', 'num_heads', 'num_kv_heads', 'head_dim', 'q_size', 'kv_size', 
+                 'scaling', 'rope_theta', 'max_position_embeddings', 'attn_use_rope', 
+                 'use_output_gate', 'layer_id', 'qkv_proj', 'o_proj', 'rotary_emb', 'attn', 'o_gate']
     def __init__(
         self,
         hidden_size: int,
@@ -105,21 +119,15 @@ class MiniCPMAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        
+        # TP=1 OPTIMIZATION: Simplified for single GPU - direct assignment
+        # Keep total_num_heads for compatibility with QKVParallelLinear
         self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
-        else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        self.head_dim = hidden_size // self.total_num_heads
+        # tp_size = get_tensor_model_parallel_world_size()
+        self.num_heads = num_heads  # TP=1: no division needed
+        self.num_kv_heads = num_kv_heads  # TP=1: no division needed
+        self.head_dim = hidden_size // num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -153,6 +161,8 @@ class MiniCPMAttention(nn.Module):
                 base=rope_theta,
                 rope_scaling=rope_scaling,
             )
+        else:
+            self.rotary_emb = None  # Always initialize for __slots__ compatibility
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -171,6 +181,8 @@ class MiniCPMAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("o_gate", prefix),
             )
+        else:
+            self.o_gate = None  # Always initialize for __slots__ compatibility
 
         self.layer_id = layer_id
 
@@ -180,22 +192,31 @@ class MiniCPMAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # TP=1 OPTIMIZATION: Cache frequently accessed attributes
+        qkv_proj = self.qkv_proj
+        o_proj = self.o_proj
+        attn = self.attn
+        rotary_emb = self.rotary_emb
+        use_output_gate = self.use_output_gate
+        q_size = self.q_size
+        kv_size = self.kv_size
+        
+        qkv, _ = qkv_proj(hidden_states)
+        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
         if self.attn_use_rope:
             orig_dtype = q.dtype
             q, k = q.float(), k.float()
-            q, k = self.rotary_emb(positions, q, k)
+            q, k = rotary_emb(positions, q, k)
             q, k = q.to(orig_dtype), k.to(orig_dtype)
 
-        attn_output = self.attn(q, k, v, forward_batch)
+        attn_output = attn(q, k, v, forward_batch)
 
-        if self.use_output_gate:
+        if use_output_gate:
             o_gate_output, _ = self.o_gate(hidden_states)
             attn_output = attn_output * F.sigmoid(o_gate_output)
 
-        output, _ = self.o_proj(attn_output)
+        output, _ = o_proj(attn_output)
         return output
 
 
@@ -205,7 +226,15 @@ class MiniCPMLightningMixer(nn.Module):
     This is a wrapper that prepares inputs for the backend and handles
     the QKV projection, normalization, RoPE, and output processing,
     while delegating the Simple GLA kernel calls to SimpleGLAAttnBackend.
+    
+    TP=1 OPTIMIZED: Simplified for single GPU
     """
+    
+    __slots__ = ['hidden_size', 'num_heads', 'num_kv_heads', 'head_dim', 'scale',
+                 'q_size', 'kv_size', 'rope_theta', 'max_position_embeddings',
+                 'use_rope', 'use_output_gate', 'qk_norm', 'use_output_norm',
+                 'rope_head_dim', 'attention_bias', 'rms_norm_eps', 'layer_id',
+                 'qkv_proj', 'o_proj', 'q_norm', 'k_norm', 'o_norm', 'z_proj', 'rotary_emb']
 
     def __init__(
         self,
@@ -230,16 +259,13 @@ class MiniCPMLightningMixer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        
+        # TP=1 OPTIMIZATION: Simplified for single GPU
+        # Keep total_num_heads for compatibility with QKVParallelLinear
         self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= tp_size:
-            assert self.total_num_kv_heads % tp_size == 0
-        else:
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         if scale == "1/sqrt(d)":
             self.scale = self.head_dim ** (-0.5)
@@ -283,6 +309,8 @@ class MiniCPMLightningMixer(nn.Module):
 
         if self.use_output_norm:
             self.o_norm = RMSNorm(self.num_heads * self.head_dim, eps=self.rms_norm_eps)
+        else:
+            self.o_norm = None  # Always initialize for __slots__ compatibility
 
         if self.use_output_gate:
             # Note: z_proj is not quantized in the checkpoint, so we don't pass quant_config
@@ -290,14 +318,19 @@ class MiniCPMLightningMixer(nn.Module):
                 self.hidden_size,
                 self.total_num_heads * self.head_dim,
                 bias=self.attention_bias,
-                quant_config=None,  # z_proj is not quantized
-                # quant_config=quant_config,
+                # quant_config=None,  # z_proj is not quantized
+                quant_config=quant_config,
                 prefix=add_prefix("z_proj", prefix),
             )
+        else:
+            self.z_proj = None  # Always initialize for __slots__ compatibility
 
         if self.qk_norm:
             self.q_norm = RMSNorm(self.head_dim, eps=self.rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=self.rms_norm_eps)
+        else:
+            self.q_norm = None  # Always initialize for __slots__ compatibility
+            self.k_norm = None  # Always initialize for __slots__ compatibility
 
         if self.use_rope:
             self.rotary_emb = get_rope(
@@ -307,6 +340,8 @@ class MiniCPMLightningMixer(nn.Module):
                 base=rope_theta,
                 rope_scaling=rope_scaling,
             )
+        else:
+            self.rotary_emb = None  # Always initialize for __slots__ compatibility
 
         self.layer_id = layer_id
         self.state_shape = (self.num_kv_heads, self.head_dim, self.head_dim)
@@ -374,26 +409,83 @@ class MiniCPMLightningMixer(nn.Module):
                 f"Expected SimpleGLAAttnBackend but got {type(linear_attn_backend).__name__}"
             )
 
-        # Prepare backend inputs
-        # Backend expects q, k, v, forward_batch, layer_id
-        # It will handle state loading/saving internally
-        o = linear_attn_backend.forward(
+        # Prepare z and norm_weight for fused output processing
+        # Backend will apply RMSNorm + sigmoid gate internally if supported
+        if self.use_output_gate and self.z_proj is not None:
+            z, _ = self.z_proj(hidden_states)  # [seq_len, hidden_size] -> [seq_len, hidden_size]
+        else:
+            z = None
+        
+        norm_weight = self.o_norm.weight if self.use_output_norm and self.o_norm is not None else None
+        
+        # Backend forward with fused output processing
+        # Returns [B*T, H*D] already processed with RMSNorm + sigmoid gate
+        o_fused = linear_attn_backend.forward(
             q=q,
             k=k,
             v=v,
             forward_batch=forward_batch,
             layer_id=self.layer_id,
             output_attentions=False,
-        )
-		
-        # if self.use_output_gate and self.use_output_norm:
-        z, _ = self.z_proj(hidden_states)   # [seq_len, hidden_size] -> [seq_len, 4096]
-        o = fused_output_processing(
-            o=o,
             z=z,
-            norm_weight=self.o_norm.weight,
-            eps=self.rms_norm_eps,
+            norm_weight=norm_weight,
         )
+        
+        # DEBUG: Compare with reference implementation (disabled - now using proven-correct kernels)
+        # if not hasattr(self, '_debug_check_done'):
+        #     self._debug_check_done = False
+        # 
+        # if not self._debug_check_done and z is not None and norm_weight is not None:
+        #     # Reference implementation: no z/norm_weight -> backend returns 4D
+        #     with torch.no_grad():
+        #         o_ref_raw = linear_attn_backend.forward(
+        #             q=q,
+        #             k=k,
+        #             v=v,
+        #             forward_batch=forward_batch,
+        #             layer_id=self.layer_id,
+        #             output_attentions=False,
+        #         )
+        #         # Apply output processing manually
+        #         if o_ref_raw.dim() == 4:
+        #             B, T, H, D = o_ref_raw.shape
+        #             o_ref = o_ref_raw.reshape(B * T, H * D)
+        #         else:
+        #             o_ref = o_ref_raw  # Already 2D
+        #         o_ref = fused_output_processing(o_ref, z, norm_weight, eps=self.rms_norm_eps)
+        #         
+        #         # Compare
+        #         diff = (o_fused.float() - o_ref.float()).abs()
+        #         max_diff = diff.max().item()
+        #         mean_diff = diff.mean().item()
+        #         
+        #         print(f"[DEBUG] Layer {self.layer_id} - Fused vs Reference:")
+        #         print(f"  Shape: {o_fused.shape}")
+        #         print(f"  Max diff: {max_diff:.6f}")
+        #         print(f"  Mean diff: {mean_diff:.6f}")
+        #         
+        #         if max_diff > 0.1:
+        #             print(f"  WARNING: Large difference detected!")
+        #             # Save inputs and outputs for analysis
+        #             dump_path = os.path.join(DEBUG_DIR, f"layer_{self.layer_id}_debug.npz")
+        #             np.savez(
+        #                 dump_path,
+        #                 q=q.cpu().float().numpy(),
+        #                 k=k.cpu().float().numpy(),
+        #                 v=v.cpu().float().numpy(),
+        #                 z=z.cpu().float().numpy(),
+        #                 norm_weight=norm_weight.cpu().float().numpy(),
+        #                 o_fused=o_fused.cpu().float().numpy(),
+        #                 o_ref=o_ref.cpu().float().numpy(),
+        #                 g_gamma=self.g_gamma.cpu().float().numpy() if hasattr(self, 'g_gamma') and self.g_gamma is not None else np.array([]),
+        #                 scale=self.scale,
+        #                 eps=self.rms_norm_eps,
+        #             )
+        #             print(f"  Saved debug data to: {dump_path}")
+        #         
+        #         self._debug_check_done = True
+        
+        # o = o_fused
         # else:
         #     o = o.reshape(-1, self.num_heads * self.head_dim)
 
@@ -404,12 +496,22 @@ class MiniCPMLightningMixer(nn.Module):
         #         z, _ = self.z_proj(hidden_states)
         #         o = o * F.sigmoid(z)
 
-        y, _ = self.o_proj(o)
+        y, _ = self.o_proj(o_fused)
         return y
 
 
 
 class MiniCPMDecoderLayer(nn.Module):
+    """TP=1 OPTIMIZED: Simplified for single GPU"""
+    __slots__ = ['config', 'layer_id', 'hidden_size', 'hidden_scale', 'mixer_type',
+                 'self_attn', 'mlp', 'input_layernorm', 'post_attention_layernorm']
+
+    @staticmethod
+    @torch.jit.script
+    def _fused_scale_add(x: torch.Tensor, residual: torch.Tensor, scale: float) -> torch.Tensor:
+        """JIT compiled fused scale + add."""
+        return residual + x * scale
+
     def __init__(
         self,
         config,
@@ -513,32 +615,40 @@ class MiniCPMDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Build sparse metadata (model-specific logic!)
+        # TP=1 OPTIMIZATION: Cache frequently accessed attributes
+        hidden_scale = self.hidden_scale
+        input_layernorm = self.input_layernorm
+        post_attention_layernorm = self.post_attention_layernorm
+        self_attn = self.self_attn
+        mlp = self.mlp
 
         # Self Attention
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(
+        residual_out = hidden_states
+        hidden_states = input_layernorm(hidden_states)
+        hidden_states = self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
 
-        # hidden_states = residual + hidden_states * self.hidden_scale
-        hidden_states = fused_scale_add(hidden_states, residual, self.hidden_scale)
+        # TP=1 OPTIMIZATION: Use JIT compiled fused scale + add
+        hidden_states = self._fused_scale_add(hidden_states, residual_out, hidden_scale)
         
         # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        residual_out = hidden_states
+        hidden_states = post_attention_layernorm(hidden_states)
+        hidden_states = mlp(hidden_states)
 
-        # hidden_states = residual + hidden_states * self.hidden_scale
-        hidden_states = fused_scale_add(hidden_states, residual, self.hidden_scale)
+        # TP=1 OPTIMIZATION: Use JIT compiled fused scale + add
+        hidden_states = self._fused_scale_add(hidden_states, residual_out, hidden_scale)
 
         return hidden_states, None
 
 
 class MiniCPMModel(nn.Module):
+    """TP=1 OPTIMIZED: Simplified for single GPU"""
+    __slots__ = ['config', 'vocab_size', 'embed_tokens', 'layers', 'norm', 'scale_emb']
+
     def __init__(
         self,
         config,
@@ -594,6 +704,9 @@ class MiniCPMModel(nn.Module):
 
 
 class MiniCPMSALAForCausalLM(nn.Module):
+    """TP=1 OPTIMIZED: Simplified for single GPU"""
+    __slots__ = ['config', 'num_experts', 'quant_config', 'model', 'lm_head', 'scale_width', 'logits_processor']
+
     def __init__(
         self,
         config,

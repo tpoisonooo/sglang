@@ -851,3 +851,124 @@ def main_with_fused_test():
 
 if __name__ == "__main__":
     main_with_fused_test()
+
+
+# =============================================================================
+# Test from NPZ Debug Files
+# =============================================================================
+
+def test_from_npz_debug():
+    """Load and test from debug npz files saved by minicpm.py."""
+    import numpy as np
+    import glob
+    
+    from test_recurrent_gla.recurrent_simple_gla_fused_output import (
+        fused_recurrent_gla_with_output_fully_fused,
+    )
+    
+    DEBUG_DIR = "/root/soar2026/debug"
+    npz_files = sorted(glob.glob(os.path.join(DEBUG_DIR, "layer_*_debug.npz")))
+    
+    if not npz_files:
+        print(f"\nNo .npz files found in {DEBUG_DIR}")
+        return
+    
+    print("\n" + "=" * 100)
+    print("Testing from NPZ Debug Files")
+    print("=" * 100)
+    print(f"Found {len(npz_files)} files to test")
+    print(f"{'File':<40} {'Shape':<20} {'Fused MAE':<15} {'Fused Max':<15} {'Status':<10}")
+    print("-" * 100)
+    
+    for npz_path in npz_files:
+        try:
+            # Load data
+            data = np.load(npz_path)
+            
+            # Convert to torch tensors
+            q = torch.from_numpy(data['q']).cuda().bfloat16()
+            k = torch.from_numpy(data['k']).cuda().bfloat16()
+            v = torch.from_numpy(data['v']).cuda().bfloat16()
+            z = torch.from_numpy(data['z']).cuda().bfloat16()
+            norm_weight = torch.from_numpy(data['norm_weight']).cuda().float()
+            o_ref = torch.from_numpy(data['o_ref']).cuda().bfloat16()
+            
+            # Optional parameters
+            scale = float(data['scale']) if 'scale' in data else (q.shape[-1] ** -0.5)
+            eps = float(data['eps']) if 'eps' in data else 1e-6
+            
+            g_gamma = None
+            if 'g_gamma' in data:
+                g_gamma_data = data['g_gamma']
+                if g_gamma_data.size > 0:
+                    g_gamma = torch.from_numpy(g_gamma_data).cuda().float()
+            
+            B, T, H, K = q.shape
+            V = v.shape[-1]
+            
+            # Run fully fused implementation
+            out_fully, _ = fused_recurrent_gla_with_output_fully_fused(
+                q, k, v, z, norm_weight,
+                g_gamma=g_gamma, scale=scale, eps=eps,
+                output_final_state=False
+            )
+            
+            # Also run FLA for comparison
+            from test_recurrent_gla.recurrent_simple_gla import fused_recurrent_simple_gla
+            from sglang.srt.models.minicpm_fused_output import fused_output_processing
+            h0_zeros = torch.zeros(B, H, K, V, dtype=torch.float32, device=q.device)
+            o_fla, _ = fused_recurrent_simple_gla(q, k, v, g_gamma=g_gamma, scale=scale,
+                                                   initial_state=h0_zeros, output_final_state=False)
+            o_fla = o_fla.reshape(B * T, H * V)
+            o_fla = fused_output_processing(o_fla, z, norm_weight, eps=eps)
+            
+            # Compare Fused vs Reference
+            diff_ref = (out_fully.float() - o_ref.float()).abs()
+            mae_ref = diff_ref.mean().item()
+            max_diff_ref = diff_ref.max().item()
+            
+            # Compare Fused vs FLA
+            diff_fla = (out_fully.float() - o_fla.float()).abs()
+            mae_fla = diff_fla.mean().item()
+            max_diff_fla = diff_fla.max().item()
+            
+            # Status based on FLA comparison (correctness check)
+            if max_diff_fla > 0.1:
+                status = "FAIL"
+            elif max_diff_fla > 0.01:
+                status = "WARN"
+            else:
+                status = "PASS"
+            
+            filename = os.path.basename(npz_path)
+            shape_str = f"[{B},{T},{H},{V}]"
+            print(f"{filename:<40} {shape_str:<20} {mae_fla:<15.6f} {max_diff_fla:<15.6f} {status} (vs Ref: {mae_ref:.3f})")
+            
+            # Detailed output for failed cases
+            if status in ["FAIL", "WARN"]:
+                print(f"  Details:")
+                print(f"    Fused output mean: {out_fully.float().mean().item():.6f}, std: {out_fully.float().std().item():.6f}")
+                print(f"    Ref output mean: {o_ref.float().mean().item():.6f}, std: {o_ref.float().std().item():.6f}")
+                
+                # Find max diff location (vs FLA)
+                max_idx = diff_fla.argmax().item()
+                print(f"    Max diff (vs FLA) location: {max_idx}")
+                print(f"    Fused value at max: {out_fully.flatten()[max_idx].item():.6f}")
+                print(f"    FLA value at max: {o_fla.flatten()[max_idx].item():.6f}")
+                
+        except Exception as e:
+            import traceback
+            filename = os.path.basename(npz_path)
+            print(f"{filename:<40} {'ERROR':<20} {'N/A':<15} {'N/A':<15} {'ERROR'}")
+            print(f"  Error: {str(e)}")
+            traceback.print_exc()
+    
+    print("=" * 100)
+
+
+if __name__ == "__main__":
+    # Run original tests
+    main_with_fused_test()
+    
+    # Run NPZ debug tests
+    test_from_npz_debug()

@@ -105,6 +105,10 @@ class ModelConfig:
         encoder_only: bool = False,
         language_only: bool = False,
         force_dense_minicpm: bool = False,
+        # ModelOpt layer exclusion options (for better quantization accuracy)
+        modelopt_skip_first_n_layers: int = 0,
+        modelopt_skip_last_n_layers: int = 0,
+        modelopt_layer_prefix: str = "model.layers",
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -156,6 +160,11 @@ class ModelConfig:
                 enable_multimodal = True
         
         self.force_dense_minicpm = force_dense_minicpm
+        
+        # ModelOpt layer exclusion settings
+        self.modelopt_skip_first_n_layers = modelopt_skip_first_n_layers
+        self.modelopt_skip_last_n_layers = modelopt_skip_last_n_layers
+        self.modelopt_layer_prefix = modelopt_layer_prefix
 
         # Config draft model
         self._config_draft_model()

@@ -1,14 +1,13 @@
 """
 Autotuned Chunk GLA implementation.
 
-Automatically selects between 2-kernel and 3-kernel based on sequence length
-to achieve optimal performance across all sizes.
+Uses the proven-correct 3-kernel approach for all sequence lengths.
+(2-kernel approach has numerical issues and is disabled)
 """
 import torch
 from typing import Optional, Tuple
 
 from chunk_gla_fused_output import chunk_simple_gla_fused_output, chunk_gla_fused_output
-from chunk_gla_fused_all import chunk_simple_gla_fused_all, chunk_gla_fused_all
 
 
 def chunk_simple_gla_autotuned(
@@ -26,12 +25,12 @@ def chunk_simple_gla_autotuned(
     eps: float = 1e-6,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """
-    Autotuned Chunk GLA with RMSNorm and gate.
+    Chunk GLA with RMSNorm and gate.
     
-    Automatically selects best kernel implementation based on sequence length:
-    - T <= 512: Uses 2-kernel (~1.4-1.7x speedup)
-    - T == 1024: Uses 3-kernel (avoids occupancy dip)
-    - T >= 2048: Uses 2-kernel (~1.07-1.16x speedup)
+    Uses the proven-correct 3-kernel approach:
+    1. chunk_fwd_h (FLA): compute hidden states
+    2. chunk_fwd_o_fused: compute output in 2D layout
+    3. fused_output_final: apply RMSNorm + sigmoid gate
     
     Args:
         q, k, v: [B, T, H, D] - QKV tensors
@@ -48,29 +47,15 @@ def chunk_simple_gla_autotuned(
         out: [B*T, H*V] - final output
         ht: final state (if output_final_state=True)
     """
-    B, T = q.shape[0], q.shape[1]
-    
-    # Heuristic: T=1024 has occupancy issues with 2-kernel
-    use_3kernel = (T == 1024)
-    
-    if use_3kernel:
-        return chunk_simple_gla_fused_output(
-            q, k, v, z, norm_weight,
-            g=g, g_gamma=g_gamma, scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
-            eps=eps
-        )
-    else:
-        return chunk_simple_gla_fused_all(
-            q, k, v, z, norm_weight,
-            g=g, g_gamma=g_gamma, scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
-            eps=eps
-        )
+    # Always use the proven-correct 3-kernel implementation
+    return chunk_simple_gla_fused_output(
+        q, k, v, z, norm_weight,
+        g=g, g_gamma=g_gamma, scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+        eps=eps
+    )
 
 
 def chunk_gla_autotuned(
@@ -89,35 +74,21 @@ def chunk_gla_autotuned(
     eps: float = 1e-6,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """
-    Autotuned Chunk GLA with full state support.
+    Chunk GLA with full state support.
     
     Same as chunk_simple_gla_autotuned but with configurable chunk_size.
+    Uses the proven-correct 3-kernel approach.
     """
-    B, T = q.shape[0], q.shape[1]
-    
-    # Heuristic: T=1024 has occupancy issues with 2-kernel
-    use_3kernel = (T == 1024)
-    
-    if use_3kernel:
-        return chunk_gla_fused_output(
-            q, k, v, z, norm_weight,
-            g=g, g_gamma=g_gamma, scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
-            chunk_size=chunk_size,
-            eps=eps
-        )
-    else:
-        return chunk_gla_fused_all(
-            q, k, v, z, norm_weight,
-            g=g, g_gamma=g_gamma, scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
-            chunk_size=chunk_size,
-            eps=eps
-        )
+    # Always use the proven-correct 3-kernel implementation
+    return chunk_gla_fused_output(
+        q, k, v, z, norm_weight,
+        g=g, g_gamma=g_gamma, scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
+        eps=eps
+    )
 
 
 # Alias for convenience

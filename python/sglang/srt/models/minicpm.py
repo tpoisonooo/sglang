@@ -29,8 +29,16 @@ from sglang.srt.layers.attention.minicpm_sparse_utils import (
     SparseMetadataBuilder,
 )
 from sglang.srt.models.minicpm_fused_norm_rope import fused_rms_norm_rope
+
 from sglang.srt.models.minicpm_fused_output import fused_output_processing
 from sglang.srt.models.minicpm_fused_scale_add import fused_scale_add
+
+import numpy as np
+import os
+
+# Create debug directory
+DEBUG_DIR = "/root/soar2026/debug"
+os.makedirs(DEBUG_DIR, exist_ok=True)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -310,8 +318,8 @@ class MiniCPMLightningMixer(nn.Module):
                 self.hidden_size,
                 self.total_num_heads * self.head_dim,
                 bias=self.attention_bias,
-                quant_config=None,  # z_proj is not quantized
-                # quant_config=quant_config,
+                # quant_config=None,  # z_proj is not quantized
+                quant_config=quant_config,
                 prefix=add_prefix("z_proj", prefix),
             )
         else:
@@ -401,26 +409,83 @@ class MiniCPMLightningMixer(nn.Module):
                 f"Expected SimpleGLAAttnBackend but got {type(linear_attn_backend).__name__}"
             )
 
-        # Prepare backend inputs
-        # Backend expects q, k, v, forward_batch, layer_id
-        # It will handle state loading/saving internally
-        o = linear_attn_backend.forward(
+        # Prepare z and norm_weight for fused output processing
+        # Backend will apply RMSNorm + sigmoid gate internally if supported
+        if self.use_output_gate and self.z_proj is not None:
+            z, _ = self.z_proj(hidden_states)  # [seq_len, hidden_size] -> [seq_len, hidden_size]
+        else:
+            z = None
+        
+        norm_weight = self.o_norm.weight if self.use_output_norm and self.o_norm is not None else None
+        
+        # Backend forward with fused output processing
+        # Returns [B*T, H*D] already processed with RMSNorm + sigmoid gate
+        o_fused = linear_attn_backend.forward(
             q=q,
             k=k,
             v=v,
             forward_batch=forward_batch,
             layer_id=self.layer_id,
             output_attentions=False,
-        )
-		
-        # if self.use_output_gate and self.use_output_norm:
-        z, _ = self.z_proj(hidden_states)   # [seq_len, hidden_size] -> [seq_len, 4096]
-        o = fused_output_processing(
-            o=o,
             z=z,
-            norm_weight=self.o_norm.weight,
-            eps=self.rms_norm_eps,
+            norm_weight=norm_weight,
         )
+        
+        # DEBUG: Compare with reference implementation (disabled - now using proven-correct kernels)
+        # if not hasattr(self, '_debug_check_done'):
+        #     self._debug_check_done = False
+        # 
+        # if not self._debug_check_done and z is not None and norm_weight is not None:
+        #     # Reference implementation: no z/norm_weight -> backend returns 4D
+        #     with torch.no_grad():
+        #         o_ref_raw = linear_attn_backend.forward(
+        #             q=q,
+        #             k=k,
+        #             v=v,
+        #             forward_batch=forward_batch,
+        #             layer_id=self.layer_id,
+        #             output_attentions=False,
+        #         )
+        #         # Apply output processing manually
+        #         if o_ref_raw.dim() == 4:
+        #             B, T, H, D = o_ref_raw.shape
+        #             o_ref = o_ref_raw.reshape(B * T, H * D)
+        #         else:
+        #             o_ref = o_ref_raw  # Already 2D
+        #         o_ref = fused_output_processing(o_ref, z, norm_weight, eps=self.rms_norm_eps)
+        #         
+        #         # Compare
+        #         diff = (o_fused.float() - o_ref.float()).abs()
+        #         max_diff = diff.max().item()
+        #         mean_diff = diff.mean().item()
+        #         
+        #         print(f"[DEBUG] Layer {self.layer_id} - Fused vs Reference:")
+        #         print(f"  Shape: {o_fused.shape}")
+        #         print(f"  Max diff: {max_diff:.6f}")
+        #         print(f"  Mean diff: {mean_diff:.6f}")
+        #         
+        #         if max_diff > 0.1:
+        #             print(f"  WARNING: Large difference detected!")
+        #             # Save inputs and outputs for analysis
+        #             dump_path = os.path.join(DEBUG_DIR, f"layer_{self.layer_id}_debug.npz")
+        #             np.savez(
+        #                 dump_path,
+        #                 q=q.cpu().float().numpy(),
+        #                 k=k.cpu().float().numpy(),
+        #                 v=v.cpu().float().numpy(),
+        #                 z=z.cpu().float().numpy(),
+        #                 norm_weight=norm_weight.cpu().float().numpy(),
+        #                 o_fused=o_fused.cpu().float().numpy(),
+        #                 o_ref=o_ref.cpu().float().numpy(),
+        #                 g_gamma=self.g_gamma.cpu().float().numpy() if hasattr(self, 'g_gamma') and self.g_gamma is not None else np.array([]),
+        #                 scale=self.scale,
+        #                 eps=self.rms_norm_eps,
+        #             )
+        #             print(f"  Saved debug data to: {dump_path}")
+        #         
+        #         self._debug_check_done = True
+        
+        # o = o_fused
         # else:
         #     o = o.reshape(-1, self.num_heads * self.head_dim)
 
@@ -431,7 +496,7 @@ class MiniCPMLightningMixer(nn.Module):
         #         z, _ = self.z_proj(hidden_states)
         #         o = o * F.sigmoid(z)
 
-        y, _ = self.o_proj(o)
+        y, _ = self.o_proj(o_fused)
         return y
 
 

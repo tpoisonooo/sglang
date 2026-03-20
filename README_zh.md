@@ -29,13 +29,9 @@ Overall TPS (Output): 431.57 tokens/s
 
 2. 简化调用，删掉 TP 相关调用
 
+已经简化
 
-## kernel 相关
 
-fusing
+## 改 NVFP4 方案
 
-chunked_gla
-
-- 计算 recurrent 和 chunk 的理论峰值，边界值是 64
-- 64~256 用 fused 版
-
+收敛精度。

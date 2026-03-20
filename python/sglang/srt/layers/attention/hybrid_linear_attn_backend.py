@@ -40,7 +40,22 @@ try:
     SIMPLE_GLA_AVAILABLE = True
 except ImportError:
     SIMPLE_GLA_AVAILABLE = False
+
+# Import our optimized fused implementations
+try:
+    from sglang.srt.layers.attention.minicpm_chunk_gla import (
+        chunk_simple_gla as chunk_simple_gla_autotuned,
+    )
+    from sglang.srt.layers.attention.minicpm_recurrent_simple_gla import (
+        fused_recurrent_gla_with_output_fully_fused as fused_recurrent_simple_gla_fused,
+    )
+    CUSTOM_FUSED_AVAILABLE = True
+except ImportError:
+    CUSTOM_FUSED_AVAILABLE = False
+    chunk_simple_gla_autotuned = None
+    fused_recurrent_simple_gla_fused = None
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.models.minicpm_fused_output import fused_output_processing
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -1558,8 +1573,22 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
         forward_batch: ForwardBatch,
         layer_id: int,
         output_attentions: bool = False,
+        z: Optional[torch.Tensor] = None,
+        norm_weight: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
+        """Forward pass with optional fused output processing.
+        
+        Args:
+            q, k, v: Query, key, value tensors [B, T, H, D]
+            forward_batch: Forward batch information
+            layer_id: Layer ID
+            output_attentions: Whether to output attention weights
+            z: Optional gate input [B*T, H*D] for fused output processing
+            norm_weight: Optional RMSNorm weight [H*D] for fused output processing
+            
+        Returns:
+            Output tensor [B, T, H, D] or [B*T, H*D] if fused output processing is used
+        """
         num_heads = q.shape[2]
         head_dim = q.shape[3]
         is_decode = forward_batch.forward_mode.is_decode()
@@ -1593,42 +1622,67 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
         scale = self.scale
         g_gamma = self.g_gamma
 
-        # 53.27s   15.40s  8.64s
-        # 52.13s    15.07s   8.75s
+        # Use custom fused kernels if available and z/norm_weight are provided
+        use_custom_fused = CUSTOM_FUSED_AVAILABLE and z is not None and norm_weight is not None
         
-        # 53.01s   15.10s  8.65s
-        # 50.11s  14.71s  8.51s
-
-        # 53.30s  15.14s   8.61s
-        # 52.22s  14.60s  8.56s
-
-        # 52.97s  15.36s  8.67s
-        # 51.68s  14.53s  7.98s
         mode = "fused_recurrent" if seq_len < 128 else "chunk"
         
-        # import pdb; pdb.set_trace()
-        if forward_batch.forward_mode.is_decode() or mode == "fused_recurrent":
-            o, final_state = fused_recurrent_simple_gla(
-                q=q,
-                k=k,
-                v=v,
-                g_gamma=g_gamma,
-                scale=scale,
-                initial_state=initial_state,
-                output_final_state=True,
-                cu_seqlens=self.forward_metadata.query_start_loc,
-            )
+        if use_custom_fused:
+            # Use our optimized fused kernels
+            if forward_batch.forward_mode.is_decode() or mode == "fused_recurrent":
+                o, final_state = fused_recurrent_simple_gla_fused(
+                    q=q,
+                    k=k,
+                    v=v,
+                    z=z,
+                    norm_weight=norm_weight,
+                    g_gamma=g_gamma,
+                    scale=scale,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                )
+            else:
+                o, final_state = chunk_simple_gla_autotuned(
+                    q=q,
+                    k=k,
+                    v=v,
+                    z=z,
+                    norm_weight=norm_weight,
+                    g_gamma=g_gamma,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    scale=scale,
+                )
         else:
-            o, final_state = chunk_simple_gla(
-                q=q,
-                k=k,
-                v=v,
-                g_gamma=g_gamma,
-                initial_state=initial_state,
-                output_final_state=True,
-                scale=scale,
-                cu_seqlens=self.forward_metadata.query_start_loc,
-            )
+            # Fall back to FLA kernels
+            if forward_batch.forward_mode.is_decode() or mode == "fused_recurrent":
+                o, final_state = fused_recurrent_simple_gla(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g_gamma=g_gamma,
+                    scale=scale,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    cu_seqlens=self.forward_metadata.query_start_loc,
+                )
+            else:
+                o, final_state = chunk_simple_gla(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g_gamma=g_gamma,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    scale=scale,
+                    cu_seqlens=self.forward_metadata.query_start_loc,
+                )
+            # Reshape to 2D [B*T, H*D]
+            o = o.reshape(-1, num_heads * head_dim)
+            
+            # Apply output processing if z and norm_weight are provided
+            if z is not None and norm_weight is not None:
+                o = fused_output_processing(o, z, norm_weight)
 
         if final_state is not None:
             # mamba_indices = self._get_mamba_indices(forward_batch)
@@ -1645,11 +1699,12 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
         #         f"Cannot save state - layer must be registered in cache_params.layers. "
         #         f"Available layers: {list(mamba_map.keys())}"
         #     )
-        # else:
-        #     import pdb; pdb.set_trace()
-        #     pass
-
+        # Reshape to 2D [B*T, H*D]
         o = o.reshape(-1, num_heads * head_dim)
+        
+        # Apply output processing if not using custom fused kernels
+        # but z and norm_weight are provided
+
 
         return o
 
