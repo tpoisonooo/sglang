@@ -293,6 +293,10 @@ class ServerArgs:
     modelopt_export_path: Optional[str] = None
     quantize_and_serve: bool = False
     rl_quant_profile: Optional[str] = None  # For flash_rl load format
+    
+    # Dynamic quantization (dual runner)
+    enable_dynamic_quant: bool = False
+    dynamic_quant_int4_path: Optional[str] = None  # Auto-detected from model_path/int4
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
@@ -666,6 +670,9 @@ class ServerArgs:
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
             return
+        
+        # Auto-detect dual model structure (model_path/fp4 and model_path/int4)
+        self._handle_dual_model_detection()
 
         # Handle deprecated arguments.
         self._handle_deprecated_args()
@@ -773,6 +780,25 @@ class ServerArgs:
                 "Falling back to 'follow_bootstrap_room' for backward compatibility."
             )
             self.load_balance_method = "follow_bootstrap_room"
+
+    def _handle_dual_model_detection(self):
+        """Auto-detect dual model structure (model_path/fp4 and model_path/int4).
+        
+        If detected, enable_dynamic_quant is set to True and model_path is updated
+        to point to the fp4 subdirectory for model config loading.
+        """
+        import os
+        
+        fp4_path = os.path.join(self.model_path, "fp4")
+        int4_path = os.path.join(self.model_path, "int4")
+        
+        if os.path.isdir(fp4_path) and os.path.isdir(int4_path):
+            logger.info(f"Detected dual model structure: {self.model_path}")
+            self.enable_dynamic_quant = True
+            # Store original path and update model_path to fp4 for config loading
+            self._dual_model_base_path = self.model_path
+            self.model_path = fp4_path
+            logger.info(f"Using FP4 model for config: {self.model_path}")
 
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers
@@ -2770,6 +2796,21 @@ class ServerArgs:
             type=str,
             default=ServerArgs.rl_quant_profile,
             help="Path to the FlashRL quantization profile. Required when using --load-format flash_rl.",
+        )
+        parser.add_argument(
+            "--enable-dynamic-quant",
+            action="store_true",
+            default=ServerArgs.enable_dynamic_quant,
+            help="Enable dynamic quantization switching between FP4 and INT4 model runners. "
+            "When enabled, the server loads both FP4 and INT4 models and switches based on batch size. "
+            "INT4 is used for small batches (fast decode), FP4 for large batches (high throughput).",
+        )
+        parser.add_argument(
+            "--dynamic-quant-int4-path",
+            type=str,
+            default=ServerArgs.dynamic_quant_int4_path,
+            help="Path to the INT4 model for dynamic quantization. "
+            "If not set, will auto-detect from model_path/int4.",
         )
 
         # Memory and scheduling

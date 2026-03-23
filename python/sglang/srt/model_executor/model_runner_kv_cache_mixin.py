@@ -424,8 +424,9 @@ class ModelRunnerKVCacheMixin:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                 )
         else:
-            # Draft worker shares req_to_token_pool with the target worker.
-            assert self.is_draft_worker
+            # Worker shares req_to_token_pool with another worker (e.g., draft worker or dual runner)
+            # Just validate it's not None
+            assert self.req_to_token_pool is not None
 
         # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
@@ -668,7 +669,9 @@ class ModelRunnerKVCacheMixin:
                         )
 
         else:
-            assert self.is_draft_worker
+            # Worker shares token_to_kv_pool_allocator with another worker
+            # Just validate it's not None
+            assert self.token_to_kv_pool_allocator is not None
             if self.is_hybrid_swa:
                 assert (
                     self.token_to_kv_pool_allocator.__class__

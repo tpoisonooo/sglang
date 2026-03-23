@@ -12,6 +12,19 @@
 # limitations under the License.
 # ==============================================================================
 """Inference-only MiniCPM model compatible with HuggingFace weights."""
+
+# Global flag for z_proj quantization (used by dynamic quantization)
+# When True, z_proj uses the parent's quant_config; when False, z_proj is not quantized
+_USE_Z_PROJ_QUANT = False
+
+def set_z_proj_quant_enabled(enabled: bool):
+    """Enable or disable z_proj quantization. Used by dynamic quantization."""
+    global _USE_Z_PROJ_QUANT
+    _USE_Z_PROJ_QUANT = enabled
+
+def get_z_proj_quant_config(parent_quant_config):
+    """Get quant_config for z_proj based on global flag."""
+    return parent_quant_config if _USE_Z_PROJ_QUANT else None
 import math
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -316,13 +329,13 @@ class MiniCPMLightningMixer(nn.Module):
             self.o_norm = None  # Always initialize for __slots__ compatibility
 
         if self.use_output_gate:
-            # Note: z_proj is not quantized in the checkpoint, so we don't pass quant_config
+            # z_proj quant_config is controlled by global flag for dynamic quantization
+            z_proj_quant_config = get_z_proj_quant_config(quant_config)
             self.z_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.total_num_heads * self.head_dim,
                 bias=self.attention_bias,
-                #quant_config=None,  # z_proj is not quantized
-                quant_config=quant_config,
+                quant_config=z_proj_quant_config,
                 prefix=add_prefix("z_proj", prefix),
             )
         else:

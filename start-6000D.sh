@@ -192,6 +192,13 @@ python3 eval_model.py \
   --data_path /root/perf.jsonl \
   --concurrency 1
 
+  python3 eval_model.py \
+  --api_base http://127.0.0.1:30000 \
+  --model_name /root/models/openbmb/MiniCPM-SALA-int4 \
+  --data_path /root/perf.jsonl \
+  --concurrency 1
+
+
 
 
 python3 -m sglang.launch_server     --model /root/models/openbmb/MiniCPM-SALA-fp4     --host "0.0.0.0"      --trust-remote-code     --port 30000     --disable-radix-cache     --attention-backend flashinfer     --chunked-prefill-size 32768     --max-running-requests  32  --tp-size 1     --kv-cache-dtype fp8_e4m3 --quantization modelopt_fp4
@@ -200,9 +207,19 @@ python3 -m sglang.launch_server     --model /root/models/openbmb/MiniCPM-SALA-fp
 
 python3 -m sglang.launch_server     --model /root/models/openbmb/MiniCPM-SALA-fp4     --host "0.0.0.0"      --trust-remote-code     --port 30000     --disable-radix-cache     --attention-backend flashinfer     --chunked-prefill-size 32768     --max-running-requests  32  --tp-size 1   --quantization modelopt_fp4 --cuda-graph-max-bs 16
 
-python3 -m sglang.launch_server     --model /root/models/openbmb/MiniCPM-SALA-fp4     --host "0.0.0.0"      --trust-remote-code     --port 30000     --disable-radix-cache     --attention-backend minicpm_flashinfer     --chunked-prefill-size 32768     --max-running-requests  32  --tp-size 1     --quantization modelopt_fp4   --kv-cache-dtype fp8_e4m3 
+python3 -m sglang.launch_server     --model /root/models/openbmb/MiniCPM-SALA-fp4     --host "0.0.0.0"      --trust-remote-code     --port 30000     --disable-radix-cache     --attention-backend fashinfer     --chunked-prefill-size 32768     --max-running-requests  32  --tp-size 1     --quantization modelopt_fp4   --kv-cache-dtype fp8_e4m3 
 
+python3 -m sglang.launch_server \
+      --model /root/models/openbmb/dual \
+      --trust-remote-code \
+      --host "0.0.0.0"  \
+      --port 30000  \
+      --attention-backend flashinfer \
+      --disable-radix-cache \
+      --chunked-prefill-size 32768     --max-running-requests  32  --tp-size 1 \
+      --cuda-graph-max-bs 16
 
+--attention-backend fashinfer  --quantization modelopt_fp4 
 
 # flashinfer + fp8-kvcache
 并发 1    89
@@ -222,10 +239,48 @@ python3 -m sglang.launch_server     --model /root/models/openbmb/MiniCPM-SALA-fp
 并发 8    548~569
 并发 16   887~945~968
 
+int4 + flashinfer
+153 / 983 / 1714
+
+dual
+161 / 947 / 1437
+
 python3 -m sglang.bench_one_batch     --model /root/models/openbmb/MiniCPM-SALA-fp4     --host "0.0.0.0"      --trust-remote-code     --port 30000     --disable-radix-cache     --attention-backend flashinfer   --chunked-prefill-size 32768     --max-running-requests  32  --tp-size 1     --quantization modelopt_fp4  --cuda-graph-max-bs 16
 
 --disable-cuda-graph
 
 --cuda-graph-max-bs 1
 
-python3 -m sglang.bench_one_batch     --model /root/models/openbmb/MiniCPM-SALA-int4     --host "0.0.0.0"      --trust-remote-code     --port 30000     --disable-radix-cache     --attention-backend flashinfer   --chunked-prefill-size 32768     --max-running-requests  32  --tp-size 1
+python3 -m sglang.bench_one_batch     --model /root/models/openbmb/MiniCPM-SALA-int4     --host "0.0.0.0"      --trust-remote-code     --port 30000     --disable-radix-cache     --attention-backend flashinfer   --chunked-prefill-size 32768     --max-running-requests  32  --tp-size 1  --kv-cache-dtype fp8_e4m3 
+
+python3 -m sglang.bench_one_batch     --model /root/models/openbmb/MiniCPM-SALA-fp4     --host "0.0.0.0"      --trust-remote-code     --port 30000     --disable-radix-cache     --attention-backend flashinfer     --chunked-prefill-size 32768     --max-running-requests  32  --tp-size 1     --quantization modelopt_fp4   --kv-cache-dtype fp8_e4m3  --cuda-graph-max-bs 16 --output-len 512
+
+python3 -m sglang.bench_one_batch \
+      --model /root/models/openbmb/dual \
+      --trust-remote-code \
+      --disable-radix-cache \
+      --attention-backend flashinfer \
+      --max-running-requests 32 \
+      --tp-size 1 \
+      --host 0.0.0.0 \
+      --port 30000
+
+--cuda-graph-max-bs 1
+
+python3 -m sglang.bench_one_batch         --model /root/models/openbmb/dual         --trust-remote-code         --disable-radix-cache         --attention-backend flashinfer         --batch 1         --input-len 8         --output-len 16         --cuda-graph-max-bs 1         --disable-cuda-graph         --prompt-filename /tmp/prompt.txt 
+
+python3 -m sglang.launch_server \
+      --model /root/models/openbmb/dual \
+      --trust-remote-code \
+      --attention-backend flashinfer \
+      --disable-radix-cache \
+      --cuda-graph-max-bs 1 \
+        --chunked-prefill-size 32768     --max-running-requests  32  --tp-size 1    
+
+# -*- coding: utf-8 -*-
+python3 -m sglang.launch_server \
+      --model /root/models/openbmb/dual/int4 \
+      --trust-remote-code \
+      --attention-backend flashinfer \
+      --dtype half \
+      --disable-cuda-graph
