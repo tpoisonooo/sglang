@@ -9,9 +9,43 @@ import gc
 import logging
 import math
 import os
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, Dict
 
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# Incremental Paged KV Cache for SM120
+# ============================================================================
+# Cache structure: {request_id: {layer_id: (cached_k, cached_v, cached_pages_set)}}
+_incremental_kv_cache: Dict[int, Dict[int, Tuple[torch.Tensor, torch.Tensor, set]]] = {}
+_next_request_id = 0
+
+def get_incremental_kv_cache(request_id: int, layer_id: int):
+    """Get cached KV for a specific request and layer."""
+    if request_id not in _incremental_kv_cache:
+        return None
+    return _incremental_kv_cache[request_id].get(layer_id, None)
+
+def set_incremental_kv_cache(request_id: int, layer_id: int, k: torch.Tensor, v: torch.Tensor, pages: set):
+    """Set cached KV for a specific request and layer."""
+    if request_id not in _incremental_kv_cache:
+        _incremental_kv_cache[request_id] = {}
+    _incremental_kv_cache[request_id][layer_id] = (k, v, pages)
+
+def clear_incremental_kv_cache(request_id: int = None):
+    """Clear cache for a specific request or all requests."""
+    global _incremental_kv_cache
+    if request_id is not None:
+        if request_id in _incremental_kv_cache:
+            del _incremental_kv_cache[request_id]
+    else:
+        _incremental_kv_cache = {}
+
+def get_next_request_id():
+    """Get next unique request ID."""
+    global _next_request_id
+    _next_request_id += 1
+    return _next_request_id - 1
 
 
 import cuda.bindings.driver as cuda
@@ -19,9 +53,10 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
-from flash_attn_origin.cute import utils
-from flash_attn_origin.cute.flash_fwd import FlashAttentionForwardSm90
-from flash_attn_origin.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
+from flash_attn.cute import utils
+from flash_attn.cute.flash_fwd import FlashAttentionForwardSm90
+from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
+from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 
 
 def maybe_contiguous(x):
@@ -267,6 +302,98 @@ def _flash_attn_fwd(
     ], "Unsupported compute capability. Supported: 9.x, 10.x, 12.x"
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
+    # SM120 specific: gather paged KV before tensor conversion
+    # SM120 kernel doesn't support paged KV natively, do Python-level gather
+    if compute_capability == 12 and page_table is not None:
+        assert seqused_k is not None, "seqused_k is required for SM120 paged KV"
+        # k/v shape: (num_pages, page_size, num_head_kv, head_dim)
+        # page_table shape: (batch_size, max_num_pages_per_seq)
+        max_num_pages_per_seq = page_table.shape[1]
+        max_seqlen_k_paged = max_num_pages_per_seq * page_size
+        
+        # OPTIMIZATION: Incremental gather for decode
+        # Use page_table data pointer and content hash as cache key
+        if batch_size == 1 and isinstance(seqused_k, torch.Tensor):
+            # Decode mode: check if we can use incremental gather
+            current_pages = page_table[0].cpu().tolist()
+            # Remove padding (-1 or 0)
+            current_pages_set = set(p for p in current_pages if p > 0)
+            
+            # Create cache key from k/v data pointers (identify KV cache buffer)
+            cache_key = (k.data_ptr(), v.data_ptr())
+            
+            cached = _incremental_kv_cache.get(cache_key)
+            if cached is not None:
+                cached_k, cached_v, cached_pages = cached
+                
+                # Find new pages that need to be gathered
+                new_pages = current_pages_set - cached_pages
+                
+                if len(new_pages) == 0:
+                    # No new pages, use cached KV directly
+                    k, v = cached_k, cached_v
+                    if batch_size == 1 and q.shape[1] <= 2:  # decode mode
+                        print(f"[INCREMENTAL] Cache hit! {len(cached_pages)} pages, seq_len={seqused_k.item() if hasattr(seqused_k, 'item') else seqused_k}", flush=True)
+                else:
+                    # Gather only new pages and concatenate
+                    if batch_size == 1 and q.shape[1] <= 2:
+                        print(f"[INCREMENTAL] Partial! {len(cached_pages)} cached, {len(new_pages)} new, total={len(current_pages_set)}", flush=True)
+                    if page_table.dtype != torch.int64:
+                        page_table_i64 = page_table.to(torch.int64)
+                    else:
+                        page_table_i64 = page_table
+                    
+                    new_pages_list = sorted(list(new_pages))
+                    new_pages_tensor = torch.tensor(new_pages_list, dtype=torch.int64, device=k.device)
+                    
+                    # Gather new pages
+                    k_new = torch.index_select(k, 0, new_pages_tensor)
+                    v_new = torch.index_select(v, 0, new_pages_tensor)
+                    
+                    # Concatenate with cached
+                    k = torch.cat([cached_k, k_new], dim=0)
+                    v = torch.cat([cached_v, v_new], dim=0)
+                    
+                    # Update cache
+                    _incremental_kv_cache[cache_key] = (k, v, current_pages_set)
+            else:
+                # First time: gather all pages
+                if batch_size == 1 and q.shape[1] <= 2:
+                    print(f"[INCREMENTAL] Cold start! {len(current_pages_set)} pages, seq_len={seqused_k.item() if hasattr(seqused_k, 'item') else seqused_k}", flush=True)
+                if page_table.dtype != torch.int64:
+                    page_table_i64 = page_table.to(torch.int64)
+                    page_table_flat = page_table_i64.reshape(-1)
+                else:
+                    page_table_flat = page_table.reshape(-1)
+                
+                k = torch.index_select(k, 0, page_table_flat)
+                v = torch.index_select(v, 0, page_table_flat)
+                
+                # Store in cache
+                _incremental_kv_cache[cache_key] = (k, v, current_pages_set)
+            
+            # Reshape for attention
+            k = k.reshape(batch_size, -1, num_head_kv, head_dim)
+            v = v.reshape(batch_size, -1, num_head_kv, head_dim_v)
+            actual_seqlen = k.shape[1]
+        else:
+            # Prefill or multi-batch: gather all pages (original logic)
+            if page_table.dtype != torch.int64:
+                page_table = page_table.to(torch.int64)
+            page_table_flat = page_table.reshape(-1)
+            
+            k = torch.index_select(k, 0, page_table_flat)
+            k = k.reshape(batch_size, max_seqlen_k_paged, num_head_kv, head_dim)
+            v = torch.index_select(v, 0, page_table_flat)
+            v = v.reshape(batch_size, max_seqlen_k_paged, num_head_kv, head_dim_v)
+            actual_seqlen = max_seqlen_k_paged
+        
+        # After gather, disable paged KV
+        page_table = None
+        page_table_tensor = None
+        num_pages, page_size = None, None
+        seqlen_k = actual_seqlen
+
     if compute_capability == 9:  # TODO: tune block size according to hdim
         # Perf heuristic from upstream: hdim=128, noncausal, non-local benefits from larger n_block
         if head_dim == head_dim_v == 128 and not causal and not local:
@@ -344,11 +471,11 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 has_buffers=buffers is not None,
             )
-        elif compute_capability in [10, 12]:
+        elif compute_capability == 10:
             assert page_size in [
                 None,
                 128,
-            ], "Only page_size=128 is supported for paged KV on SM 10.0/12.0"
+            ], "Only page_size=128 is supported for paged KV on SM 10.0"
             fa_fwd = FlashAttentionForwardSm100(
                 head_dim,
                 head_dim_v,
@@ -362,6 +489,24 @@ def _flash_attn_fwd(
                 and seqused_q is None,
                 score_mod=score_mod,
                 has_buffers=buffers is not None,
+            )
+        elif compute_capability == 12:
+            # SM120 (Blackwell): Use dedicated SM120 kernel
+            # SM120 uses SM80 MMA but with 99KB SMEM (vs 163KB on SM80)
+            # SM120 requires (tile_m * 2) % num_threads == 0
+            # Use smaller tile_n for SM120 to fit in shared memory
+            fa_fwd = FlashAttentionForwardSm120(
+                dtype,
+                head_dim,
+                head_dim_v,
+                qhead_per_kvhead=qhead_per_kvhead,
+                tile_m=128,
+                tile_n=64,  # Smaller tile for SM120 (99KB SMEM constraint)
+                num_threads=256,  # Must divide tile_m * 2 = 256
+                is_causal=causal,
+                is_local=local,
+                pack_gqa=pack_gqa,
+                has_aux_tensors=buffers is not None,
             )
         else:
             raise ValueError(

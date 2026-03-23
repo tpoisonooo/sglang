@@ -84,6 +84,30 @@ class MiniCPMBackendMetadata:
     cu_seqlens_q_adjusted: Optional[torch.Tensor] = None
     max_seqlen_q_adjusted: Optional[int] = None
     cache_seqlens_int32_stage1: torch.Tensor = None
+    
+    # Sparse attention metadata (for CUDA graph capture)
+    sparse_cache_seqlens_int32: torch.Tensor = None
+    sparse_cu_seqlens_q: torch.Tensor = None
+    sparse_cu_seqlens_k: torch.Tensor = None
+    sparse_page_table: torch.Tensor = None
+    token_to_bs: torch.Tensor = None
+    token_pos_in_bs: torch.Tensor = None
+    k1: Optional[CompressionLevelMetadata] = None
+    k2: Optional[CompressionLevelMetadata] = None
+    sparse_bs_list: Optional[list] = None
+    seqlen_k_sparse_bs_tensor: Optional[torch.Tensor] = None
+    sparse_cu_seqlens_q_cpu: Optional[torch.Tensor] = None
+    old_bs_to_new_bs_range: Optional[dict] = None
+    sparse_max_seq_len_q: Optional[int] = None
+    
+    # CUDA graph decode wrapper
+    decode_wrapper: Optional[object] = None
+    
+    # Encoder metadata
+    encoder_max_seq_len_k: Optional[int] = None
+    encoder_lens_int32: Optional[torch.Tensor] = None
+    encoder_cu_seqlens_k: Optional[torch.Tensor] = None
+    encoder_page_table: Optional[torch.Tensor] = None
 
 
 # Copied from:
@@ -359,13 +383,9 @@ class MiniCPMSparseBackend(AttentionBackend):
         self.attention_kernel = create_attention_kernel(attention_kernel, model_runner)
         self.attention_kernel_type = attention_kernel
         
-        # TP=1 OPTIMIZATION: Create flash_attn kernel for decode (hybrid mode)
-        # This allows prefill to use one backend (e.g., fa4) while decode uses flash_attn (FA3)
-        if self._decode_use_flashattn:
-            from sglang.srt.layers.attention.minicpm_attention_kernels import FlashAttentionKernel
-            self.decode_attention_kernel = FlashAttentionKernel()
-        else:
-            self.decode_attention_kernel = self.attention_kernel
+        # TP=1 OPTIMIZATION: Use the same kernel for decode (FA4 on SM120)
+        # FA4 supports both prefill and decode on SM120 via cutlass DSL
+        self.decode_attention_kernel = self.attention_kernel
 
         # Initialize sparse attention helpers (required for MiniCPM)
         sparse_config = SparseConfig.from_model_config(
@@ -470,11 +490,16 @@ class MiniCPMSparseBackend(AttentionBackend):
                 if forward_batch.seq_lens_cpu[i] >= self.dense_len:
                     seqlens_q_sparse_list.append(forward_batch.extend_seq_lens_cpu[i])
             
-            seqlen_q_sparse_tensor = torch.tensor(seqlens_q_sparse_list, dtype=torch.int32, device=metadata.cu_seqlens_q.device)
-            cu_seqlen_q_sparse_tensor = F.pad(torch.cumsum(seqlen_q_sparse_tensor, dim=0, dtype=torch.int32), (1, 0))
-            # metadata.cu_seqlens_q = torch.cat(cu_seqlens_q_list, dim=0)
-            metadata.cu_seqlens_q_adjusted = cu_seqlen_q_sparse_tensor * self.heads_per_group
-            metadata.max_seqlen_q_adjusted = seqlen_q_sparse_tensor.max().item() * self.heads_per_group
+            # Handle empty list case to avoid max() error
+            if len(seqlens_q_sparse_list) > 0:
+                seqlen_q_sparse_tensor = torch.tensor(seqlens_q_sparse_list, dtype=torch.int32, device=metadata.cu_seqlens_q.device)
+                cu_seqlen_q_sparse_tensor = F.pad(torch.cumsum(seqlen_q_sparse_tensor, dim=0, dtype=torch.int32), (1, 0))
+                metadata.cu_seqlens_q_adjusted = cu_seqlen_q_sparse_tensor * self.heads_per_group
+                metadata.max_seqlen_q_adjusted = seqlen_q_sparse_tensor.max().item() * self.heads_per_group
+            else:
+                # No sparse sequences, set adjusted values to 0
+                metadata.cu_seqlens_q_adjusted = torch.zeros(1, dtype=torch.int32, device=metadata.cu_seqlens_q.device)
+                metadata.max_seqlen_q_adjusted = 0
         else:
             decode_metadata = self.sparse_metadata_builder.build_sparse_decode_metadata(
                 forward_batch=forward_batch,
@@ -1215,7 +1240,8 @@ class MiniCPMSparseBackend(AttentionBackend):
         q_reshaped_by_head_group = q_reshaped.reshape(
             -1, layer.tp_q_head_num // 2, layer.head_dim
         )
-        assert self.page_size == 1
+        # Support both page_size=1 and page_size=128 (FA4 requirement)
+        # key_cache shape: (-1, page_size, num_heads, head_dim)
         key_cache_by_head_group = key_cache.reshape(
             -1, self.page_size, layer.tp_k_head_num // 2, layer.head_dim
         )
@@ -1364,7 +1390,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                     ),
                     "sparse_page_table": torch.zeros(
                         max_bs * 2,
-                        sparse_max_num_pages,
+                        self.num_sparse_topk_tokens,  # Use tokens, not pages for FA4 compatibility
                         dtype=torch.int32,
                         device=self.device,
                     ),
@@ -1641,7 +1667,8 @@ class MiniCPMSparseBackend(AttentionBackend):
             # For flashinfer with CUDA graph:
             # During capture, we need to set up the wrapper with slice views.
             # The actual data will be updated during replay (outside graph).
-            if self.attention_kernel_type == "flashinfer":
+            # Note: On SM120, we may have fallback to FlashAttentionKernel
+            if self.attention_kernel_type == "flashinfer" and hasattr(self.attention_kernel, 'decode_workspace'):
                 sparse_bs = bs * 2
 
                 # Get batch-sized SLICE VIEWS of pre-allocated buffers
@@ -1782,7 +1809,8 @@ class MiniCPMSparseBackend(AttentionBackend):
 
             # Update flashinfer metadata for CUDA graph replay
             # For sparse mode, use the wrapper-based pattern that preserves sparse_page_table
-            if self.attention_kernel_type == "flashinfer":
+            # Note: On SM120, we may have fallback to FlashAttentionKernel
+            if self.attention_kernel_type == "flashinfer" and hasattr(self.attention_kernel, 'decode_workspace'):
                 sparse_bs = bs * 2
                 sparse_real_bs = real_bs * 2
 
@@ -1904,8 +1932,21 @@ class MiniCPMSparseBackend(AttentionBackend):
                 metadata.k2.cu_total_compress_token_nums[real_bs + 1 :].fill_(forward_batch.cu_total_compress_k2_token_nums_cpu[-1])
                 
 
-            metadata.k1.table.copy_(self.req_to_sparse_k1_token[req_pool_indices])
-            metadata.k2.table.copy_(self.req_to_sparse_k2_token[req_pool_indices])
+            # Copy k1/k2 table with dimension check to avoid shape mismatch in CUDA graph replay
+            src_k1 = self.req_to_sparse_k1_token[req_pool_indices]
+            if src_k1.shape[1] == metadata.k1.table.shape[1]:
+                metadata.k1.table.copy_(src_k1)
+            else:
+                # Handle dimension mismatch (e.g., different page counts)
+                min_cols = min(src_k1.shape[1], metadata.k1.table.shape[1])
+                metadata.k1.table[:, :min_cols].copy_(src_k1[:, :min_cols])
+            
+            src_k2 = self.req_to_sparse_k2_token[req_pool_indices]
+            if src_k2.shape[1] == metadata.k2.table.shape[1]:
+                metadata.k2.table.copy_(src_k2)
+            else:
+                min_cols = min(src_k2.shape[1], metadata.k2.table.shape[1])
+                metadata.k2.table[:, :min_cols].copy_(src_k2[:, :min_cols])
         else:
             raise NotImplementedError(
                 "MiniCPM backend CUDA graph replay only supports decode/idle mode, "

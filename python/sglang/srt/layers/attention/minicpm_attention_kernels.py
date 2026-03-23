@@ -118,12 +118,25 @@ class FlashAttentionKernel(AttentionKernel):
     """Flash Attention kernel implementation.
 
     This class wraps the flash_attn_with_kvcache function from sgl_kernel.
+    Auto-detects SM120 and uses FA4, otherwise uses FA3.
     """
 
-    def __init__(self):
-        from sgl_kernel.flash_attn import flash_attn_with_kvcache
-
-        self.flash_attn_func = flash_attn_with_kvcache
+    def __init__(self, use_fa4: bool = False):
+        # Auto-detect SM120 (Blackwell) - FA3 doesn't have SM120 kernel
+        compute_capability = torch.cuda.get_device_capability()[0]
+        if compute_capability == 12:
+            use_fa4 = True
+            
+        self.use_fa4 = use_fa4
+        
+        if use_fa4:
+            # FA4 path: directly use flash_attn_varlen_func_v4
+            from sgl_kernel.flash_attn import flash_attn_varlen_func_v4
+            self.fa4_func = flash_attn_varlen_func_v4
+        else:
+            # FA3 path: use flash_attn_with_kvcache
+            from sgl_kernel.flash_attn import flash_attn_with_kvcache
+            self.flash_attn_func = flash_attn_with_kvcache
 
     def forward(
         self,
@@ -131,6 +144,50 @@ class FlashAttentionKernel(AttentionKernel):
         layer: RadixAttention,
     ) -> torch.Tensor:
         """Perform attention computation using flash attention."""
+        if self.use_fa4:
+            return self._forward_fa4(params)
+        else:
+            return self._forward_fa3(params)
+    
+    def _forward_fa4(self, params: AttentionParams) -> torch.Tensor:
+        """Forward using FA4 (flash_attn_varlen_func_v4).
+        
+        Note: FA4 supports paged KV via Python-level gather for SM120.
+        SM120 uses SM80 kernel with paged KV gather in _fa4_interface.py.
+        """
+        
+        # Convert window_size format: (-1, -1) -> (None, None)
+        window_size = params.window_size
+        if window_size == (-1, -1):
+            window_size = (None, None)
+        else:
+            # Convert -1 to None for FA4
+            window_left = window_size[0] if window_size[0] != -1 else None
+            window_right = window_size[1] if window_size[1] != -1 else None
+            window_size = (window_left, window_right)
+        
+        # FA4 uses seqused_k instead of cache_seqlens
+        # Note: FA4 doesn't support k_descale/v_descale directly in this interface
+        out = self.fa4_func(
+            q=params.q,
+            k=params.k_cache,
+            v=params.v_cache,
+            cu_seqlens_q=params.cu_seqlens_q,
+            cu_seqlens_k=None,  # FA4 uses seqused_k for paged attention
+            seqused_q=None,
+            seqused_k=params.cache_seqlens,  # This is the KV cache lengths
+            page_table=params.page_table,
+            softmax_scale=params.softmax_scale,
+            causal=params.causal,
+            window_size=window_size,
+            softcap=params.softcap,
+            pack_gqa=None,  # Auto-determine
+            return_softmax_lse=False,
+        )
+        return out
+    
+    def _forward_fa3(self, params: AttentionParams) -> torch.Tensor:
+        """Forward using FA3 (flash_attn_with_kvcache)."""
         # Prepare kwargs based on fa_impl_ver
         kwargs = {}
         if params.fa_impl_ver != 3:
@@ -505,7 +562,7 @@ def create_attention_kernel(
     """Factory function to create the appropriate attention kernel.
 
     Args:
-        kernel_type: Type of kernel to create ('flash_attn' or 'flashinfer')
+        kernel_type: Type of kernel to create ('flash_attn', 'flashinfer', or 'fa4')
         model_runner: The model runner instance
 
     Returns:
@@ -514,9 +571,18 @@ def create_attention_kernel(
     Raises:
         ValueError: If kernel_type is not recognized
     """
+    # Auto-detect SM120 (Blackwell) - flashinfer may not have SM120 kernel
+    compute_capability = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
+    
     if kernel_type == "flash_attn":
-        return FlashAttentionKernel()
+        return FlashAttentionKernel(use_fa4=False)
+    elif kernel_type == "fa4":
+        return FlashAttentionKernel(use_fa4=True)
     elif kernel_type == "flashinfer":
+        # SM120 (Blackwell) fallback to FA4 since flashinfer may not have SM120 kernel
+        if compute_capability == 12:
+            print("[WARNING] FlashInfer may not support SM120, using FA4 instead")
+            return FlashAttentionKernel(use_fa4=True)
         return FlashInferKernel(model_runner)
     else:
         raise ValueError(f"Unknown attention kernel type: {kernel_type}")

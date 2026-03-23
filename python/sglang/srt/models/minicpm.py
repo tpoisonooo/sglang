@@ -192,6 +192,7 @@ class MiniCPMAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        import time
         # TP=1 OPTIMIZATION: Cache frequently accessed attributes
         qkv_proj = self.qkv_proj
         o_proj = self.o_proj
@@ -201,6 +202,7 @@ class MiniCPMAttention(nn.Module):
         q_size = self.q_size
         kv_size = self.kv_size
         
+        # QKV projection
         qkv, _ = qkv_proj(hidden_states)
         q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
@@ -211,12 +213,13 @@ class MiniCPMAttention(nn.Module):
             q, k = q.to(orig_dtype), k.to(orig_dtype)
 
         attn_output = attn(q, k, v, forward_batch)
-
+        
         if use_output_gate:
             o_gate_output, _ = self.o_gate(hidden_states)
             attn_output = attn_output * F.sigmoid(o_gate_output)
 
         output, _ = o_proj(attn_output)
+        
         return output
 
 
@@ -318,7 +321,7 @@ class MiniCPMLightningMixer(nn.Module):
                 self.hidden_size,
                 self.total_num_heads * self.head_dim,
                 bias=self.attention_bias,
-                # quant_config=None,  # z_proj is not quantized
+                #quant_config=None,  # z_proj is not quantized
                 quant_config=quant_config,
                 prefix=add_prefix("z_proj", prefix),
             )
@@ -699,7 +702,9 @@ class MiniCPMModel(nn.Module):
                 forward_batch,
                 residual,
             )
+
         hidden_states = self.norm(hidden_states)
+
         return hidden_states
 
 

@@ -19,9 +19,10 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
-from flash_attn_origin.cute import utils
-from flash_attn_origin.cute.flash_fwd import FlashAttentionForwardSm90
-from flash_attn_origin.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
+from flash_attn.cute import utils
+from flash_attn.cute.flash_fwd import FlashAttentionForwardSm90
+from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
+from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 
 
 def maybe_contiguous(x):
@@ -64,13 +65,8 @@ def _flash_attn_fwd(
     lse: Optional[torch.Tensor] = None,
     buffers: Optional[list[torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    # HACK: Convert FP8 to BF16 for FA4 (FA4 doesn't support FP8)
-    # if q.dtype == torch.float8_e4m3fn or q.dtype == torch.float8_e5m2:
-    #     q = q.to(torch.bfloat16)
-    # if k.dtype == torch.float8_e4m3fn or k.dtype == torch.float8_e5m2:
-    #     k = k.to(torch.bfloat16)
-    # if v.dtype == torch.float8_e4m3fn or v.dtype == torch.float8_e5m2:
-    #     v = v.to(torch.bfloat16)
+    # NOTE: FP8 to BF16 conversion disabled for performance reasons
+    # FP8 KV cache is not recommended on SM120 due to conversion overhead
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:
@@ -267,6 +263,25 @@ def _flash_attn_fwd(
     ], "Unsupported compute capability. Supported: 9.x, 10.x, 12.x"
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
+    # SM120 specific: gather paged KV before tensor conversion
+    # SM120 kernel doesn't support paged KV natively, do Python-level gather
+    if compute_capability == 12 and page_table is not None:
+        assert seqused_k is not None, "seqused_k is required for SM120 paged KV"
+        # k/v shape: (num_pages, page_size, num_head_kv, head_dim)
+        # page_table shape: (batch_size, max_num_pages_per_seq)
+        max_num_pages_per_seq = page_table.shape[1]
+        max_seqlen_k_paged = max_num_pages_per_seq * page_size
+        # Gather pages: [num_pages, page_size, ...] -> [batch_size, max_seqlen_k_paged, ...]
+        # Note: PyTorch indexing requires int64 (long) indices
+        page_table_long = page_table.reshape(-1).to(torch.int64)
+        k = k[page_table_long].reshape(batch_size, max_seqlen_k_paged, num_head_kv, head_dim)
+        v = v[page_table_long].reshape(batch_size, max_seqlen_k_paged, num_head_kv, head_dim_v)
+        # After gather, disable paged KV
+        page_table = None
+        page_table_tensor = None  # Also clear the tensor
+        num_pages, page_size = None, None
+        seqlen_k = max_seqlen_k_paged
+
     if compute_capability == 9:  # TODO: tune block size according to hdim
         # Perf heuristic from upstream: hdim=128, noncausal, non-local benefits from larger n_block
         if head_dim == head_dim_v == 128 and not causal and not local:
@@ -344,11 +359,11 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 has_buffers=buffers is not None,
             )
-        elif compute_capability in [10, 12]:
+        elif compute_capability == 10:
             assert page_size in [
                 None,
                 128,
-            ], "Only page_size=128 is supported for paged KV on SM 10.0/12.0"
+            ], "Only page_size=128 is supported for paged KV on SM 10.0"
             fa_fwd = FlashAttentionForwardSm100(
                 head_dim,
                 head_dim_v,
@@ -362,6 +377,24 @@ def _flash_attn_fwd(
                 and seqused_q is None,
                 score_mod=score_mod,
                 has_buffers=buffers is not None,
+            )
+        elif compute_capability == 12:
+            # SM120 (Blackwell): Use dedicated SM120 kernel
+            # SM120 uses SM80 MMA but with 99KB SMEM (vs 163KB on SM80)
+            # SM120 requires (tile_m * 2) % num_threads == 0
+            # Use smaller tile_n for SM120 to fit in shared memory
+            fa_fwd = FlashAttentionForwardSm120(
+                dtype,
+                head_dim,
+                head_dim_v,
+                qhead_per_kvhead=qhead_per_kvhead,
+                tile_m=128,
+                tile_n=64,  # Smaller tile for SM120 (99KB SMEM constraint)
+                num_threads=256,  # Must divide tile_m * 2 = 256
+                is_causal=causal,
+                is_local=local,
+                pack_gqa=pack_gqa,
+                has_aux_tensors=buffers is not None,
             )
         else:
             raise ValueError(

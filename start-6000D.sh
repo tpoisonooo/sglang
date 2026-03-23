@@ -189,6 +189,43 @@ python3 -m sglang.launch_server     --model /root/models/openbmb/MiniCPM-SALA-fp
 python3 eval_model.py \
   --api_base http://127.0.0.1:30000 \
   --model_name /root/models/openbmb/MiniCPM-SALA-fp4 \
-  --data_path /root/perf_public_set.jsonl \
-  --concurrency 16
+  --data_path /root/perf.jsonl \
+  --concurrency 1
 
+
+
+python3 -m sglang.launch_server     --model /root/models/openbmb/MiniCPM-SALA-fp4     --host "0.0.0.0"      --trust-remote-code     --port 30000     --disable-radix-cache     --attention-backend flashinfer     --chunked-prefill-size 32768     --max-running-requests  32  --tp-size 1     --kv-cache-dtype fp8_e4m3 --quantization modelopt_fp4
+
+88token/s
+
+python3 -m sglang.launch_server     --model /root/models/openbmb/MiniCPM-SALA-fp4     --host "0.0.0.0"      --trust-remote-code     --port 30000     --disable-radix-cache     --attention-backend flashinfer     --chunked-prefill-size 32768     --max-running-requests  32  --tp-size 1   --quantization modelopt_fp4 --cuda-graph-max-bs 16
+
+python3 -m sglang.launch_server     --model /root/models/openbmb/MiniCPM-SALA-fp4     --host "0.0.0.0"      --trust-remote-code     --port 30000     --disable-radix-cache     --attention-backend minicpm_flashinfer     --chunked-prefill-size 32768     --max-running-requests  32  --tp-size 1     --quantization modelopt_fp4   --kv-cache-dtype fp8_e4m3 
+
+
+
+# flashinfer + fp8-kvcache
+并发 1    89
+并发 8    671
+并发 16   1254
+
+# flashinfer
+并发 1    88~89
+并发 8    675~680
+并发 16   1246~1254~1274
+
+# minicpm_flashinfer
+并发 1    76~78~80~82
+并发 8    538~562
+
+# minicpm_flashattn
+并发 8    548~569
+并发 16   887~945~968
+
+python3 -m sglang.bench_one_batch     --model /root/models/openbmb/MiniCPM-SALA-fp4     --host "0.0.0.0"      --trust-remote-code     --port 30000     --disable-radix-cache     --attention-backend flashinfer   --chunked-prefill-size 32768     --max-running-requests  32  --tp-size 1     --quantization modelopt_fp4  --cuda-graph-max-bs 16
+
+--disable-cuda-graph
+
+--cuda-graph-max-bs 1
+
+python3 -m sglang.bench_one_batch     --model /root/models/openbmb/MiniCPM-SALA-int4     --host "0.0.0.0"      --trust-remote-code     --port 30000     --disable-radix-cache     --attention-backend flashinfer   --chunked-prefill-size 32768     --max-running-requests  32  --tp-size 1
