@@ -48,5 +48,7 @@ else
     echo "Warning: Could not find infllm_v2 path. infllm_v2 patches not applied."
 fi
 
-export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --trust-remote-code --attention-backend flashinfer --quantization modelopt_fp4 "
+export SGLANG_SERVER_ARGS="${SGLANG_SERVER_ARGS:-} --trust-remote-code --attention-backend flashinfer"
 export HF_ENDPOINT=https://hf-mirror.com
+
+

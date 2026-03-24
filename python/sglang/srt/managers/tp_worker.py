@@ -306,6 +306,18 @@ class TpModelWorker(BaseTpWorker):
 
         # Profile number of tokens
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
+        
+        # Ensure consistency with token_to_kv_pool_allocator size
+        # This is critical for dual runner setup where memory pools are shared
+        if (hasattr(self.model_runner, 'token_to_kv_pool_allocator') and 
+            self.model_runner.token_to_kv_pool_allocator is not None):
+            allocator_size = self.model_runner.token_to_kv_pool_allocator.size
+            if self.max_total_num_tokens != allocator_size:
+                logger.warning(
+                    f"max_total_num_tokens ({self.max_total_num_tokens}) != "
+                    f"allocator.size ({allocator_size}). Using allocator size."
+                )
+                self.max_total_num_tokens = allocator_size
         self.max_prefill_tokens = server_args.max_prefill_tokens
         self.max_running_requests = self.model_runner.max_running_requests
         assert self.max_running_requests > 0, "max_running_request is zero"
@@ -506,6 +518,10 @@ class TpModelWorker(BaseTpWorker):
         self._fp4_model_runner.sampler = self._int4_model_runner.sampler
         #if hasattr(self._int4_model_runner, 'decode_attn_backend'):
         #    self._fp4_model_runner.decode_attn_backend = self._int4_model_runner.decode_attn_backend
+        
+        # Sync max_total_num_tokens to ensure memory check consistency
+        # Both runners share the same memory pool, so they should report the same size
+        self._fp4_model_runner.max_total_num_tokens = self._int4_model_runner.max_total_num_tokens
         
         logger.info(f"FP4 runner initialized: {fp4_path}")
         

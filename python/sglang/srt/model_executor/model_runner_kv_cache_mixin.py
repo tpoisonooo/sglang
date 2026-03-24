@@ -253,12 +253,10 @@ class ModelRunnerKVCacheMixin:
         # and use the shared pool's settings
         if self.req_to_token_pool is not None and self.token_to_kv_pool_allocator is not None:
             logger.info("Memory pools already shared from another runner, skipping pool initialization")
-            # Copy max_total_num_tokens from the shared allocator if available
-            if hasattr(self.token_to_kv_pool_allocator, 'max_total_num_tokens'):
-                self.max_total_num_tokens = self.token_to_kv_pool_allocator.max_total_num_tokens
-            else:
-                # Estimate from the pool size
-                self.max_total_num_tokens = 100000  # Safe default
+            # Use the allocator's size as max_total_num_tokens to ensure consistency
+            # The allocator's size is the actual memory pool capacity
+            self.max_total_num_tokens = self.token_to_kv_pool_allocator.size
+            logger.info(f"Using shared pool size: max_total_num_tokens={self.max_total_num_tokens}")
             # Also get token_to_kv_pool from allocator if not already set
             if not hasattr(self, 'token_to_kv_pool'):
                 self.token_to_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
