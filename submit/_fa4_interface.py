@@ -9,9 +9,20 @@ import gc
 import logging
 import math
 import os
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, Dict
 
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# Incremental Paged KV Cache for SM120
+# ============================================================================
+# Cache structure: {(k_ptr, v_ptr): (cached_k, cached_v, cached_pages_set)}
+_incremental_kv_cache: Dict[tuple, tuple] = {}
+
+def clear_incremental_kv_cache():
+    """Clear all incremental KV cache."""
+    global _incremental_kv_cache
+    _incremental_kv_cache = {}
 
 
 import cuda.bindings.driver as cuda
@@ -271,16 +282,68 @@ def _flash_attn_fwd(
         # page_table shape: (batch_size, max_num_pages_per_seq)
         max_num_pages_per_seq = page_table.shape[1]
         max_seqlen_k_paged = max_num_pages_per_seq * page_size
-        # Gather pages: [num_pages, page_size, ...] -> [batch_size, max_seqlen_k_paged, ...]
-        # Note: PyTorch indexing requires int64 (long) indices
-        page_table_long = page_table.reshape(-1).to(torch.int64)
-        k = k[page_table_long].reshape(batch_size, max_seqlen_k_paged, num_head_kv, head_dim)
-        v = v[page_table_long].reshape(batch_size, max_seqlen_k_paged, num_head_kv, head_dim_v)
+        
+        # OPTIMIZATION: Incremental gather for decode (bs=1, small seqlen)
+        global _incremental_kv_cache
+        actual_seqlen = max_seqlen_k_paged
+        
+        if batch_size == 1 and isinstance(seqused_k, torch.Tensor) and seqused_k.item() <= 128:
+            # Decode mode: use incremental gather
+            current_pages = page_table[0].cpu().tolist()
+            # Filter valid pages (positive page numbers)
+            current_pages_set = set(p for p in current_pages if p > 0)
+            
+            # Use KV cache buffer pointer as key
+            cache_key = (k.data_ptr(), v.data_ptr())
+            cached = _incremental_kv_cache.get(cache_key)
+            
+            if cached is not None:
+                cached_k, cached_v, cached_pages = cached
+                new_pages = current_pages_set - cached_pages
+                
+                if len(new_pages) == 0:
+                    # Cache hit: reuse gathered KV
+                    k, v = cached_k, cached_v
+                else:
+                    # Partial hit: gather only new pages
+                    new_pages_list = sorted(list(new_pages))
+                    new_pages_tensor = torch.tensor(new_pages_list, dtype=torch.int64, device=k.device)
+                    
+                    k_new = torch.index_select(k, 0, new_pages_tensor)
+                    v_new = torch.index_select(v, 0, new_pages_tensor)
+                    
+                    # Concatenate
+                    k = torch.cat([cached_k, k_new], dim=0)
+                    v = torch.cat([cached_v, v_new], dim=0)
+                    
+                    # Update cache
+                    _incremental_kv_cache[cache_key] = (k, v, current_pages_set)
+            else:
+                # Cold start: gather all pages
+                page_table_long = page_table.reshape(-1).to(torch.int64)
+                k = torch.index_select(k, 0, page_table_long)
+                v = torch.index_select(v, 0, page_table_long)
+                
+                # Store in cache
+                _incremental_kv_cache[cache_key] = (k, v, current_pages_set)
+            
+            # Reshape
+            k = k.reshape(batch_size, -1, num_head_kv, head_dim)
+            v = v.reshape(batch_size, -1, num_head_kv, head_dim_v)
+            actual_seqlen = k.shape[1]
+        else:
+            # Prefill or multi-batch: gather all pages (original)
+            page_table_long = page_table.reshape(-1).to(torch.int64)
+            k = torch.index_select(k, 0, page_table_long)
+            k = k.reshape(batch_size, max_seqlen_k_paged, num_head_kv, head_dim)
+            v = torch.index_select(v, 0, page_table_long)
+            v = v.reshape(batch_size, max_seqlen_k_paged, num_head_kv, head_dim_v)
+        
         # After gather, disable paged KV
         page_table = None
-        page_table_tensor = None  # Also clear the tensor
+        page_table_tensor = None
         num_pages, page_size = None, None
-        seqlen_k = max_seqlen_k_paged
+        seqlen_k = actual_seqlen
 
     if compute_capability == 9:  # TODO: tune block size according to hdim
         # Perf heuristic from upstream: hdim=128, noncausal, non-local benefits from larger n_block

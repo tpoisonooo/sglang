@@ -12,6 +12,19 @@
 # limitations under the License.
 # ==============================================================================
 """Inference-only MiniCPM model compatible with HuggingFace weights."""
+
+# Global flag for z_proj quantization (used by dynamic quantization)
+# When True, z_proj uses the parent's quant_config; when False, z_proj is not quantized
+_USE_Z_PROJ_QUANT = False
+
+def set_z_proj_quant_enabled(enabled: bool):
+    """Enable or disable z_proj quantization. Used by dynamic quantization."""
+    global _USE_Z_PROJ_QUANT
+    _USE_Z_PROJ_QUANT = enabled
+
+def get_z_proj_quant_config(parent_quant_config):
+    """Get quant_config for z_proj based on global flag."""
+    return parent_quant_config if _USE_Z_PROJ_QUANT else None
 import math
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -192,6 +205,7 @@ class MiniCPMAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        import time
         # TP=1 OPTIMIZATION: Cache frequently accessed attributes
         qkv_proj = self.qkv_proj
         o_proj = self.o_proj
@@ -201,6 +215,7 @@ class MiniCPMAttention(nn.Module):
         q_size = self.q_size
         kv_size = self.kv_size
         
+        # QKV projection
         qkv, _ = qkv_proj(hidden_states)
         q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
@@ -211,12 +226,13 @@ class MiniCPMAttention(nn.Module):
             q, k = q.to(orig_dtype), k.to(orig_dtype)
 
         attn_output = attn(q, k, v, forward_batch)
-
+        
         if use_output_gate:
             o_gate_output, _ = self.o_gate(hidden_states)
             attn_output = attn_output * F.sigmoid(o_gate_output)
 
         output, _ = o_proj(attn_output)
+        
         return output
 
 
@@ -313,13 +329,14 @@ class MiniCPMLightningMixer(nn.Module):
             self.o_norm = None  # Always initialize for __slots__ compatibility
 
         if self.use_output_gate:
-            # Note: z_proj is not quantized in the checkpoint, so we don't pass quant_config
+            # z_proj quant_config is controlled by global flag for dynamic quantization
+            # z_proj_quant_config = get_z_proj_quant_config(quant_config)
+            z_proj_quant_config = None 
             self.z_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.total_num_heads * self.head_dim,
                 bias=self.attention_bias,
-                # quant_config=None,  # z_proj is not quantized
-                quant_config=quant_config,
+                quant_config=z_proj_quant_config,
                 prefix=add_prefix("z_proj", prefix),
             )
         else:
@@ -699,7 +716,9 @@ class MiniCPMModel(nn.Module):
                 forward_batch,
                 residual,
             )
+
         hidden_states = self.norm(hidden_states)
+
         return hidden_states
 
 

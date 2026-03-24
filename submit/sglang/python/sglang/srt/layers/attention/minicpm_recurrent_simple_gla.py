@@ -227,5 +227,6 @@ def fused_recurrent_gla_fused_output(
     return out, ht
 
 
-# Convenient alias
+# Convenient aliases
 fused_forward = fused_recurrent_gla_fused_output
+fused_recurrent_gla_with_output_fully_fused = fused_recurrent_simple_gla_with_output

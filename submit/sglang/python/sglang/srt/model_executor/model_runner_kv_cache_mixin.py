@@ -248,6 +248,20 @@ class ModelRunnerKVCacheMixin:
     def init_memory_pool(self: ModelRunner, total_gpu_memory: int):
         max_num_reqs = self.server_args.max_running_requests
         max_total_tokens = self.server_args.max_total_tokens
+        
+        # If memory pools are already shared (passed from another runner), skip calculation
+        # and use the shared pool's settings
+        if self.req_to_token_pool is not None and self.token_to_kv_pool_allocator is not None:
+            logger.info("Memory pools already shared from another runner, skipping pool initialization")
+            # Use the allocator's size as max_total_num_tokens to ensure consistency
+            # The allocator's size is the actual memory pool capacity
+            self.max_total_num_tokens = self.token_to_kv_pool_allocator.size
+            logger.info(f"Using shared pool size: max_total_num_tokens={self.max_total_num_tokens}")
+            # Also get token_to_kv_pool from allocator if not already set
+            if not hasattr(self, 'token_to_kv_pool'):
+                self.token_to_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+            return
+        
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
 
         if max_num_reqs is None:
@@ -424,8 +438,9 @@ class ModelRunnerKVCacheMixin:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                 )
         else:
-            # Draft worker shares req_to_token_pool with the target worker.
-            assert self.is_draft_worker
+            # Worker shares req_to_token_pool with another worker (e.g., draft worker or dual runner)
+            # Just validate it's not None
+            assert self.req_to_token_pool is not None
 
         # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
@@ -668,7 +683,9 @@ class ModelRunnerKVCacheMixin:
                         )
 
         else:
-            assert self.is_draft_worker
+            # Worker shares token_to_kv_pool_allocator with another worker
+            # Just validate it's not None
+            assert self.token_to_kv_pool_allocator is not None
             if self.is_hybrid_swa:
                 assert (
                     self.token_to_kv_pool_allocator.__class__

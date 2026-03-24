@@ -155,14 +155,29 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+        
+        # Filter out invalid indices (0 is the padding slot, should never be freed)
+        # and remove duplicates to prevent double-free
+        unique_indices = torch.unique(free_index[free_index != 0])
+        if unique_indices.numel() == 0:
+            return
+        
+        # Safety check: prevent exceeding allocator capacity
+        current_available = len(self.free_pages) + len(self.release_pages)
+        if current_available + unique_indices.numel() > self.size:
+            available_space = self.size - current_available
+            if available_space > 0:
+                unique_indices = unique_indices[:available_space]
+            else:
+                return
 
         if self.is_not_in_free_group:
             if self.need_sort:
-                self.release_pages = torch.cat((self.release_pages, free_index))
+                self.release_pages = torch.cat((self.release_pages, unique_indices))
             else:
-                self.free_pages = torch.cat((self.free_pages, free_index))
+                self.free_pages = torch.cat((self.free_pages, unique_indices))
         else:
-            self.free_group.append(free_index)
+            self.free_group.append(unique_indices)
 
     def get_cpu_copy(self, indices):
         return self._kvcache.get_cpu_copy(indices)

@@ -1577,6 +1577,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
+        # If attn_backend is already shared from another runner, skip initialization
+        if hasattr(self, 'attn_backend') and self.attn_backend is not None:
+            logger.info("Attention backend already shared from another runner, skipping initialization")
+            return
+        
         if self.server_args.enable_pdmux:
             self.attn_backend = self._get_attention_backend(init_new_workspace=True)
             self.decode_attn_backend_group = []

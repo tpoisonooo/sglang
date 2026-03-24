@@ -14,7 +14,9 @@
 """A tensor parallel worker."""
 from __future__ import annotations
 
+import copy
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional
 
@@ -236,8 +238,42 @@ class TpModelWorker(BaseTpWorker):
         # MTP model runners
         self.model_runner_list = []
 
+        # Dynamic quantization support (auto-detect dual model structure)
+        self.enable_dynamic_quant = getattr(server_args, 'enable_dynamic_quant', False)
+        self._fp4_model_runner = None
+        self._int4_model_runner = None
+        self._active_runner_type = "fp4"  # default
+        
+        # Auto-detect dual model structure using _dual_model_base_path if available
+        if not is_draft_worker:
+            # Use stored base path if available (set by server_args), otherwise use model_path
+            dual_base = getattr(self.server_args, '_dual_model_base_path', None)
+            check_path = dual_base or self.server_args.model_path
+            
+            fp4_path = os.path.join(check_path, "fp4")
+            int4_path = os.path.join(check_path, "int4")
+            if os.path.isdir(fp4_path) and os.path.isdir(int4_path):
+                if dual_base is None:
+                    logger.info(f"Detected dual model structure: {check_path}")
+                    self.enable_dynamic_quant = True
+                # Store paths for later use
+                self._dual_fp4_path = fp4_path
+                self._dual_int4_path = int4_path
+            else:
+                self._dual_fp4_path = None
+                self._dual_int4_path = None
+
         self._init_model_config()
-        self._init_model_runner()
+        
+        # Allow disabling dual runner via environment variable for testing
+        if os.environ.get('SGLANG_DISABLE_DUAL_RUNNER') == '1':
+            logger.info("Dual runner disabled via SGLANG_DISABLE_DUAL_RUNNER=1")
+            self.enable_dynamic_quant = False
+        
+        if self.enable_dynamic_quant and not is_draft_worker:
+            self._init_dual_model_runners()
+        else:
+            self._init_model_runner()
 
         if is_multi_layer_eagle:
             self._init_multi_layer_eagle_model_runners()
@@ -270,6 +306,18 @@ class TpModelWorker(BaseTpWorker):
 
         # Profile number of tokens
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
+        
+        # Ensure consistency with token_to_kv_pool_allocator size
+        # This is critical for dual runner setup where memory pools are shared
+        if (hasattr(self.model_runner, 'token_to_kv_pool_allocator') and 
+            self.model_runner.token_to_kv_pool_allocator is not None):
+            allocator_size = self.model_runner.token_to_kv_pool_allocator.size
+            if self.max_total_num_tokens != allocator_size:
+                logger.warning(
+                    f"max_total_num_tokens ({self.max_total_num_tokens}) != "
+                    f"allocator.size ({allocator_size}). Using allocator size."
+                )
+                self.max_total_num_tokens = allocator_size
         self.max_prefill_tokens = server_args.max_prefill_tokens
         self.max_running_requests = self.model_runner.max_running_requests
         assert self.max_running_requests > 0, "max_running_request is zero"
@@ -338,6 +386,219 @@ class TpModelWorker(BaseTpWorker):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
         )
+
+    def _init_dual_model_runners(self):
+        """Initialize both FP4 and INT4 model runners for dynamic quantization."""
+        from sglang.srt.model_executor.model_runner import ModelRunner
+        from sglang.srt.configs.model_config import ModelConfig
+        
+        logger.info("Initializing dual model runners for dynamic quantization")
+        
+        # Import z_proj quant config controller
+        from sglang.srt.models.minicpm import set_z_proj_quant_enabled
+        
+        # Split memory fraction between two runners
+        mem_fraction_per_runner = self.server_args.mem_fraction_static / 2
+        
+        # Determine paths: use stored dual base path or auto-detect
+        import os
+        dual_base = getattr(self.server_args, '_dual_model_base_path', None)
+        if dual_base:
+            fp4_path = os.path.join(dual_base, "fp4")
+            int4_path = os.path.join(dual_base, "int4")
+        else:
+            # Fallback to explicit paths or model_path
+            fp4_path = getattr(
+                self.server_args, 'dynamic_quant_fp4_path', self.server_args.model_path
+            )
+            int4_path = getattr(
+                self.server_args, 'dynamic_quant_int4_path', self.server_args.model_path
+            )
+        
+        logger.info(f"Dual runner paths - FP4: {fp4_path}, INT4: {int4_path}")
+        
+        # 1. Initialize INT4 runner first (default for low concurrency)
+        # For INT4/GPTQ, z_proj is NOT quantized
+        set_z_proj_quant_enabled(False)
+        
+        int4_server_args = copy.deepcopy(self.server_args)
+        int4_server_args.model_path = int4_path
+        int4_server_args.quantization = "gptq"  # INT4 uses GPTQ/Marlin
+        int4_server_args.dtype = "half"  # GPTQ requires float16
+        # Keep tokenizer from FP4 model (shared tokenizer)
+        int4_server_args.tokenizer_path = self.server_args.tokenizer_path
+        
+        # Create INT4 model config
+        int4_model_config = ModelConfig.from_server_args(
+            int4_server_args,
+            model_path=int4_server_args.model_path,
+            model_revision=self.server_args.revision,
+            is_draft_model=False,
+        )
+        
+        self._int4_model_runner = ModelRunner(
+            model_config=int4_model_config,
+            mem_fraction_static=mem_fraction_per_runner,
+            gpu_id=self.gpu_id,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            moe_ep_rank=self.moe_ep_rank,
+            moe_ep_size=self.ep_size,
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
+            nccl_port=self.nccl_port,
+            dp_rank=self.dp_rank,
+            server_args=int4_server_args,
+            is_draft_worker=False,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            draft_model_idx=None,
+        )
+        
+        logger.info(f"INT4 runner initialized: {int4_path}")
+        
+        # Debug: Check INT4 z_proj status immediately after init
+        try:
+            # Find first layer with z_proj (mixed architecture)
+            for i, layer in enumerate(self._int4_model_runner.model.model.layers):
+                if hasattr(layer.self_attn, 'z_proj'):
+                    int4_z_proj_quant = getattr(layer.self_attn.z_proj, 'quant_config', None) is not None
+                    logger.info(f"[DualRunner] INT4 layer {i} z_proj quantized: {int4_z_proj_quant}")
+                    break
+        except Exception as e:
+            logger.warning(f"[DualRunner] Failed to check INT4 z_proj: {e}")
+        
+        # Reset distributed state for second runner (TP=1 case)
+        # This is safe because TP=1 doesn't actually use distributed
+        from sglang.srt.distributed.parallel_state import destroy_model_parallel
+        destroy_model_parallel()
+        
+        # 2. Initialize FP4 runner (for high concurrency)
+        # For FP4, z_proj IS quantized
+        set_z_proj_quant_enabled(True)
+        
+        fp4_server_args = copy.deepcopy(self.server_args)
+        fp4_server_args.model_path = fp4_path
+        fp4_server_args.quantization = "modelopt_fp4"  # FP4 uses modelopt_fp4 quantization
+        fp4_server_args.dtype = "half"  # Use float16 to match INT4 runner for consistency
+        
+        # Create FP4 model config with correct quantization
+        fp4_model_config = ModelConfig.from_server_args(
+            fp4_server_args,
+            model_path=fp4_path,
+            model_revision=self.server_args.revision,
+            is_draft_model=False,
+        )
+        
+        # Create FP4 runner sharing INT4 runner's memory pools
+        # This ensures KV cache is shared between prefill (FP4) and decode (INT4)
+        logger.info("Creating FP4 runner with shared memory pools from INT4 runner")
+        self._fp4_model_runner = ModelRunner(
+            model_config=fp4_model_config,
+            mem_fraction_static=mem_fraction_per_runner,
+            gpu_id=self.gpu_id,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            moe_ep_rank=self.moe_ep_rank,
+            moe_ep_size=self.ep_size,
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
+            nccl_port=self.nccl_port,
+            dp_rank=self.dp_rank,
+            server_args=fp4_server_args,
+            is_draft_worker=False,
+            req_to_token_pool=self._int4_model_runner.req_to_token_pool,
+            token_to_kv_pool_allocator=self._int4_model_runner.token_to_kv_pool_allocator,
+            draft_model_idx=None,
+        )
+        
+        # Also share token_to_kv_pool, attn_backend and sampler directly
+        self._fp4_model_runner.token_to_kv_pool = self._int4_model_runner.token_to_kv_pool
+        self._fp4_model_runner.attn_backend = self._int4_model_runner.attn_backend
+        self._fp4_model_runner.sampler = self._int4_model_runner.sampler
+        #if hasattr(self._int4_model_runner, 'decode_attn_backend'):
+        #    self._fp4_model_runner.decode_attn_backend = self._int4_model_runner.decode_attn_backend
+        
+        # Sync max_total_num_tokens to ensure memory check consistency
+        # Both runners share the same memory pool, so they should report the same size
+        self._fp4_model_runner.max_total_num_tokens = self._int4_model_runner.max_total_num_tokens
+        
+        logger.info(f"FP4 runner initialized: {fp4_path}")
+        
+        # Debug: Check FP4 z_proj status immediately after init
+        try:
+            # Find first layer with z_proj (mixed architecture)
+            for i, layer in enumerate(self._fp4_model_runner.model.model.layers):
+                if hasattr(layer.self_attn, 'z_proj'):
+                    fp4_z_proj_quant = getattr(layer.self_attn.z_proj, 'quant_config', None) is not None
+                    logger.info(f"[DualRunner] FP4 layer {i} z_proj quantized: {fp4_z_proj_quant}")
+                    break
+        except Exception as e:
+            logger.warning(f"[DualRunner] Failed to check FP4 z_proj: {e}")
+        
+        # Debug: Check z_proj quantization status
+        try:
+            # Find first layer with z_proj in both runners
+            int4_z_proj_quant = None
+            fp4_z_proj_quant = None
+            for i, layer in enumerate(self._int4_model_runner.model.model.layers):
+                if hasattr(layer.self_attn, 'z_proj'):
+                    int4_z_proj_quant = getattr(layer.self_attn.z_proj, 'quant_config', None) is not None
+                    break
+            for i, layer in enumerate(self._fp4_model_runner.model.model.layers):
+                if hasattr(layer.self_attn, 'z_proj'):
+                    fp4_z_proj_quant = getattr(layer.self_attn.z_proj, 'quant_config', None) is not None
+                    break
+            logger.info(f"[DualRunner] z_proj quantization - INT4: {int4_z_proj_quant}, FP4: {fp4_z_proj_quant}")
+        except Exception as e:
+            logger.warning(f"[DualRunner] Failed to check z_proj status: {e}")
+            import traceback
+            logger.warning(traceback.format_exc())
+        
+        # Default to INT4 runner (for memory pool reference)
+        # Scheduler uses tp_worker's memory pool references
+        self._model_runner = self._int4_model_runner
+        self._active_runner_type = "int4"
+        self.req_to_token_pool = self._int4_model_runner.req_to_token_pool
+        self.token_to_kv_pool_allocator = self._int4_model_runner.token_to_kv_pool_allocator
+        logger.info("Dynamic quantization ready: Prefill-Decode separation (default INT4, scheduler uses INT4 memory pools)")
+
+    def switch_model_runner(self, runner_type: str):
+        """Switch between FP4 and INT4 model runners.
+        
+        Args:
+            runner_type: "fp4" or "int4"
+        """
+        if not self.enable_dynamic_quant:
+            return
+            
+        if runner_type == self._active_runner_type:
+            return
+        
+        if runner_type == "fp4":
+            if self._fp4_model_runner is None:
+                logger.warning("FP4 runner not available")
+                return
+            self._model_runner = self._fp4_model_runner
+            self._active_runner_type = "fp4"
+            # Verify memory pool sharing
+            int4_pool_id = id(self._int4_model_runner.token_to_kv_pool)
+            fp4_pool_id = id(self._fp4_model_runner.token_to_kv_pool)
+            logger.info(f"[DualRunner] Switched to FP4 | KV pool INT4: {int4_pool_id}, FP4: {fp4_pool_id}, shared: {int4_pool_id == fp4_pool_id}")
+        elif runner_type == "int4":
+            if self._int4_model_runner is None:
+                logger.warning("INT4 runner not available")
+                return
+            self._model_runner = self._int4_model_runner
+            self._active_runner_type = "int4"
+            logger.info(f"[DualRunner] Switched to INT4 runner (batch size hint: low)")
+        else:
+            logger.warning(f"Unknown runner type: {runner_type}")
+
+    @property
+    def active_runner_type(self) -> str:
+        """Get current active runner type."""
+        return self._active_runner_type if self.enable_dynamic_quant else "fp4"
 
     def _init_multi_layer_eagle_model_runners(self):
         from sglang.srt.model_executor.model_runner import ModelRunner

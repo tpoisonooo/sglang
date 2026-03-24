@@ -1627,56 +1627,30 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
         
         mode = "fused_recurrent" if seq_len < 128 else "chunk"
         
-        if use_custom_fused:
-            # Use our optimized fused kernels
-            if forward_batch.forward_mode.is_decode() or mode == "fused_recurrent":
-                o, final_state = fused_recurrent_simple_gla_fused(
-                    q=q,
-                    k=k,
-                    v=v,
-                    z=z,
-                    norm_weight=norm_weight,
-                    g_gamma=g_gamma,
-                    scale=scale,
-                    initial_state=initial_state,
-                    output_final_state=True,
-                )
-            else:
-                o, final_state = chunk_simple_gla_autotuned(
-                    q=q,
-                    k=k,
-                    v=v,
-                    z=z,
-                    norm_weight=norm_weight,
-                    g_gamma=g_gamma,
-                    initial_state=initial_state,
-                    output_final_state=True,
-                    scale=scale,
-                )
+        # Use custom fused recurrent for decode, FLA chunk for prefill
+        if forward_batch.forward_mode.is_decode() or mode == "fused_recurrent":
+            o, final_state = fused_recurrent_simple_gla_fused(
+                q=q,
+                k=k,
+                v=v,
+                z=z,
+                norm_weight=norm_weight,
+                g_gamma=g_gamma,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=True,
+            )
         else:
-            # Fall back to FLA kernels
-            if forward_batch.forward_mode.is_decode() or mode == "fused_recurrent":
-                o, final_state = fused_recurrent_simple_gla(
-                    q=q,
-                    k=k,
-                    v=v,
-                    g_gamma=g_gamma,
-                    scale=scale,
-                    initial_state=initial_state,
-                    output_final_state=True,
-                    cu_seqlens=self.forward_metadata.query_start_loc,
-                )
-            else:
-                o, final_state = chunk_simple_gla(
-                    q=q,
-                    k=k,
-                    v=v,
-                    g_gamma=g_gamma,
-                    initial_state=initial_state,
-                    output_final_state=True,
-                    scale=scale,
-                    cu_seqlens=self.forward_metadata.query_start_loc,
-                )
+            o, final_state = chunk_simple_gla(
+                q=q,
+                k=k,
+                v=v,
+                g_gamma=g_gamma,
+                initial_state=initial_state,
+                output_final_state=True,
+                scale=scale,
+                cu_seqlens=self.forward_metadata.query_start_loc,
+            )
             # Reshape to 2D [B*T, H*D]
             o = o.reshape(-1, num_heads * head_dim)
             
@@ -1699,11 +1673,8 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
         #         f"Cannot save state - layer must be registered in cache_params.layers. "
         #         f"Available layers: {list(mamba_map.keys())}"
         #     )
-        # Reshape to 2D [B*T, H*D]
-        o = o.reshape(-1, num_heads * head_dim)
-        
-        # Apply output processing if not using custom fused kernels
-        # but z and norm_weight are provided
+        # Note: fused_recurrent_simple_gla_fused returns 2D output
+        # chunk_simple_gla returns 4D output which is reshaped above
 
 
         return o

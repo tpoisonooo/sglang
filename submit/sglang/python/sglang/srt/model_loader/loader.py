@@ -2475,6 +2475,22 @@ class ModelOptModelLoader(DefaultModelLoader):
 
             # Apply quantization
             mtq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
+            
+            # Disable quantization for z_proj layers (heterogeneous layer in LightningAttention)
+            # This must be done after quantization setup but before calibration
+            disabled_count = 0
+            for name, module in model.named_modules():
+                if 'z_proj' in name and hasattr(module, 'weight_quantizer'):
+                    if hasattr(module.weight_quantizer, 'disable'):
+                        module.weight_quantizer.disable()
+                        disabled_count += 1
+                    # Also disable input/output quantizers if they exist
+                    if hasattr(module, 'input_quantizer') and hasattr(module.input_quantizer, 'disable'):
+                        module.input_quantizer.disable()
+                    if hasattr(module, 'output_quantizer') and hasattr(module.output_quantizer, 'disable'):
+                        module.output_quantizer.disable()
+            if disabled_count > 0:
+                print(f"🚫 Disabled quantization for {disabled_count} z_proj layers")
 
             if (
                 not model_parallel_is_initialized()
@@ -2645,18 +2661,6 @@ class ModelOptModelLoader(DefaultModelLoader):
                 skip_last_n=skip_last_n,
                 layer_prefix=layer_prefix,
             )
-        
-        # Exclude z_proj from quantization (heterogeneous layer in LightningAttention)
-        # z_proj only exists in linear attention layers and should not be quantized
-        # to maintain accuracy. This applies to both model and turtle_model.
-        import copy
-        quant_cfg = copy.deepcopy(quant_cfg)
-        # Pattern matches z_proj in any nested structure (model.layers.X.self_attn.z_proj
-        # or turtle_model.model.layers.X.self_attn.z_proj)
-        quant_cfg['quant_cfg']['*.self_attn.z_proj'] = {'enable': False}
-        quant_cfg['quant_cfg']['*.*.self_attn.z_proj'] = {'enable': False}
-        quant_cfg['quant_cfg']['*.*.*.self_attn.z_proj'] = {'enable': False}
-        logger.info("Excluding z_proj layers from quantization (heterogeneous linear attention layer)")
 
         logger.info(
             f"Quantizing model with ModelOpt using config: mtq.{quant_cfg_name}"

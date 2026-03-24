@@ -171,13 +171,15 @@ class BenchArgs:
     result_filename: str = "result.jsonl"
     correctness_test: bool = False
     # This is only used for correctness test
-    cut_len: int = 4
+    cut_len: int = 0  # Default to 0 for dual runner compatibility
     log_decode_step: int = 0
     profile: bool = False
     profile_record_shapes: bool = False
     profile_activities: Tuple[str] = ("CPU", "GPU")
     profile_stage: str = "all"
     profile_filename_prefix: str = "profile"
+    # Batch merging for small batches to improve GPU occupancy
+    merge_small_batches_threshold: int = None  # Minimum total tokens to trigger merging
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -233,35 +235,216 @@ class BenchArgs:
             help="Prefix of the profiling file names. The full profiling result file(s) be "
             '"[profile_filename_prefix]_batch[batch_size]_input[input_len]_output[output_len].trace.json.gz"',
         )
+        parser.add_argument(
+            "--merge-small-batches-threshold",
+            type=int,
+            default=BenchArgs.merge_small_batches_threshold,
+            help="Minimum total token count to trigger batch merging. "
+            "If batch_size * input_len < threshold, multiple sequences will be "
+            "merged into one long sequence to improve GPU occupancy. "
+            "Only applies to prefill phase. Disabled by default.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         # use the default value's type to cast the args into correct types.
-        attrs = [(attr.name, type(attr.default)) for attr in dataclasses.fields(cls)]
+        def get_attr_type(attr):
+            # Handle None defaults - use the type of the actual value from args
+            if attr.default is None:
+                return lambda x: x
+            return type(attr.default)
+        
+        attrs = [(attr.name, get_attr_type(attr)) for attr in dataclasses.fields(cls)]
         return cls(
             **{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs}
         )
+
+
+class DualModelRunner:
+    """Dual model runner for FP4 prefill + INT4 decode separation."""
+    
+    def __init__(self, fp4_runner, int4_runner, active_runner="fp4"):
+        self.fp4_runner = fp4_runner
+        self.int4_runner = int4_runner
+        self._active_runner = fp4_runner if active_runner == "fp4" else int4_runner
+        self.active_runner_type = active_runner
+        
+        # Expose memory-related attributes from INT4 runner (main runner for decode)
+        # These are shared/common across both runners
+        self.max_total_num_tokens = int4_runner.max_total_num_tokens
+        self.req_to_token_pool = int4_runner.req_to_token_pool
+        self.token_to_kv_pool_allocator = int4_runner.token_to_kv_pool_allocator
+        self.token_to_kv_pool = int4_runner.token_to_kv_pool
+        
+    def __getattr__(self, name):
+        """Forward attribute access to the active runner."""
+        # Avoid infinite recursion for internal attributes
+        if name in ('fp4_runner', 'int4_runner', '_active_runner', 'active_runner_type'):
+            raise AttributeError(name)
+        return getattr(self._active_runner, name)
+        
+    @property
+    def model_runner(self):
+        """Return currently active runner."""
+        return self._active_runner
+        
+    def switch_runner(self, runner_type):
+        """Switch between fp4 and int4 runners."""
+        if runner_type == self.active_runner_type:
+            return
+        if runner_type == "fp4":
+            self._active_runner = self.fp4_runner
+            self.active_runner_type = "fp4"
+        elif runner_type == "int4":
+            self._active_runner = self.int4_runner
+            self.active_runner_type = "int4"
+        else:
+            raise ValueError(f"Unknown runner type: {runner_type}")
+            
+    def forward(self, forward_batch):
+        """Forward pass using active runner."""
+        return self._active_runner.forward(forward_batch)
+        
+    def sample(self, logits_output, forward_batch):
+        """Sample using active runner."""
+        return self._active_runner.sample(logits_output, forward_batch)
 
 
 def load_model(server_args, port_args, gpu_id, tp_rank):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
     moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
+    
+    # Check for dual model structure
+    # server_args may have been modified by _handle_dual_model_detection
+    dual_base = getattr(server_args, '_dual_model_base_path', None)
+    if dual_base:
+        # server_args.model_path is already pointing to fp4 subdirectory
+        fp4_path = server_args.model_path
+        int4_path = os.path.join(dual_base, "int4")
+        is_dual_structure = os.path.isdir(fp4_path) and os.path.isdir(int4_path)
+    else:
+        fp4_path = os.path.join(server_args.model_path, "fp4")
+        int4_path = os.path.join(server_args.model_path, "int4")
+        is_dual_structure = os.path.isdir(fp4_path) and os.path.isdir(int4_path)
+    
+    if is_dual_structure and tp_rank == 0:
+        rank_print(f"Detected dual model structure, enabling FP4+INT4 dynamic quantization")
+        rank_print(f"  FP4 path: {fp4_path}")
+        rank_print(f"  INT4 path: {int4_path}")
 
-    model_config = ModelConfig.from_server_args(server_args)
-    model_runner = ModelRunner(
-        model_config=model_config,
-        mem_fraction_static=server_args.mem_fraction_static,
-        gpu_id=gpu_id,
-        tp_rank=tp_rank,
-        tp_size=server_args.tp_size,
-        moe_ep_rank=moe_ep_rank,
-        moe_ep_size=server_args.ep_size,
-        pp_rank=0,
-        pp_size=1,
-        nccl_port=port_args.nccl_port,
-        server_args=server_args,
-    )
+    if is_dual_structure:
+        # Dual model mode: load both FP4 and INT4 runners
+        from sglang.srt.models.minicpm import set_z_proj_quant_enabled
+        from sglang.srt.distributed.parallel_state import destroy_model_parallel
+        
+        # Split memory between two runners
+        # INT4 runner loads first and owns the memory pools
+        # FP4 runner loads second and shares INT4's memory pools for KV cache consistency
+        int4_mem_fraction = 0.80  # INT4 owns memory pools, needs enough for KV cache
+        fp4_mem_fraction = 0.80  # FP4 shares pools, just needs enough for model weights
+        
+        # 1. Load INT4 runner first (for decode) - owns memory pools
+        set_z_proj_quant_enabled(False)
+        
+        int4_server_args = copy.deepcopy(server_args)
+        int4_server_args.model_path = int4_path
+        int4_server_args.quantization = "gptq"
+        int4_server_args.dtype = "half"
+        
+        rank_print(f"[DualRunner] Loading INT4 runner from: {int4_path}")
+        rank_print(f"[DualRunner] INT4 quantization: {int4_server_args.quantization}")
+        
+        int4_model_config = ModelConfig.from_server_args(
+            int4_server_args,
+            model_path=int4_path,
+        )
+        rank_print(f"[DualRunner] INT4 config quantization: {int4_model_config.quantization}")
+        int4_server_args.mem_fraction_static = int4_mem_fraction
+        int4_runner = ModelRunner(
+            model_config=int4_model_config,
+            mem_fraction_static=int4_mem_fraction,
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            tp_size=server_args.tp_size,
+            moe_ep_rank=moe_ep_rank,
+            moe_ep_size=server_args.ep_size,
+            pp_rank=0,
+            pp_size=1,
+            nccl_port=port_args.nccl_port,
+            server_args=int4_server_args,
+        )
+        
+        rank_print(f"INT4 runner initialized (for decode)")
+        
+        # 2. Load FP4 runner (for prefill) - shares INT4's memory pools
+        # Must reset distributed state for second runner
+        from sglang.srt.distributed.parallel_state import destroy_distributed_environment
+        destroy_model_parallel()
+        destroy_distributed_environment()
+        
+        set_z_proj_quant_enabled(True)
+        
+        fp4_server_args = copy.deepcopy(server_args)
+        fp4_server_args.model_path = fp4_path
+        fp4_server_args.quantization = "modelopt_fp4"
+        fp4_server_args.dtype = "half"  # Match INT4 dtype
+        
+        rank_print(f"[DualRunner] Loading FP4 runner from: {fp4_path}")
+        rank_print(f"[DualRunner] FP4 quantization: {fp4_server_args.quantization}")
+        
+        fp4_model_config = ModelConfig.from_server_args(
+            fp4_server_args,
+            model_path=fp4_path,
+        )
+        rank_print(f"[DualRunner] FP4 config quantization: {fp4_model_config.quantization}")
+        
+        # Create FP4 runner sharing INT4's memory pools for KV cache consistency
+        fp4_server_args.mem_fraction_static = fp4_mem_fraction
+        rank_print(f"[DualRunner] Creating FP4 runner with shared memory pools from INT4")
+        fp4_runner = ModelRunner(
+            model_config=fp4_model_config,
+            mem_fraction_static=fp4_mem_fraction,
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            tp_size=server_args.tp_size,
+            moe_ep_rank=moe_ep_rank,
+            moe_ep_size=server_args.ep_size,
+            pp_rank=0,
+            pp_size=1,
+            nccl_port=port_args.nccl_port,
+            server_args=fp4_server_args,
+            req_to_token_pool=int4_runner.req_to_token_pool,
+            token_to_kv_pool_allocator=int4_runner.token_to_kv_pool_allocator,
+        )
+        
+        # Also share token_to_kv_pool and attn_backend references
+        fp4_runner.token_to_kv_pool = int4_runner.token_to_kv_pool
+        fp4_runner.attn_backend = int4_runner.attn_backend
+        rank_print(f"[DualRunner] Shared token_to_kv_pool and attn_backend between runners")
+        
+        rank_print(f"FP4 runner initialized (for prefill)")
+        
+        # Wrap in DualModelRunner, default to FP4 for prefill
+        model_runner = DualModelRunner(fp4_runner, int4_runner, active_runner="fp4")
+        rank_print("Dual runner ready: FP4 for prefill, INT4 for decode")
+    else:
+        # Single model mode
+        model_config = ModelConfig.from_server_args(server_args)
+        model_runner = ModelRunner(
+            model_config=model_config,
+            mem_fraction_static=server_args.mem_fraction_static,
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            tp_size=server_args.tp_size,
+            moe_ep_rank=moe_ep_rank,
+            moe_ep_size=server_args.ep_size,
+            pp_rank=0,
+            pp_size=1,
+            nccl_port=port_args.nccl_port,
+            server_args=server_args,
+        )
+        
     rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")
     tokenizer = get_tokenizer(
         server_args.tokenizer_path,
@@ -323,8 +506,22 @@ def prepare_extend_inputs_for_correctness_test(
 
 
 def prepare_synthetic_inputs_for_latency_test(
-    batch_size, input_len, custom_inputs=None
+    batch_size, input_len, custom_inputs=None, merge_small_batches_threshold=None
 ):
+    """
+    Prepare synthetic input requests for latency testing.
+    
+    Args:
+        batch_size: Number of sequences in the batch
+        input_len: Length of each input sequence
+        custom_inputs: Optional custom input ids to use instead of random
+        merge_small_batches_threshold: If set, merge small batches into larger ones
+            to improve GPU occupancy. The value is the minimum total token count
+            to trigger merging. For example, if batch_size=2, input_len=256, 
+            total_tokens=512, and merge_small_batches_threshold=1024, then the
+            two sequences will be merged into one sequence of length 512.
+            Note: This is only for benchmarking prefill throughput with small batches.
+    """
     input_ids = (
         custom_inputs
         if custom_inputs
@@ -334,6 +531,39 @@ def prepare_synthetic_inputs_for_latency_test(
         temperature=0,
         max_new_tokens=BenchArgs.output_len,
     )
+
+    # Check if we should merge batches
+    total_tokens = batch_size * input_len
+    should_merge = (
+        merge_small_batches_threshold is not None 
+        and total_tokens < merge_small_batches_threshold
+        and batch_size > 1
+    )
+
+    # import pdb; pdb.set_trace()
+
+    if should_merge:
+        # Merge all input_ids into a single long sequence
+        merged_input_ids = np.concatenate(input_ids).tolist()
+        print(
+            f"[Batch Merge] Merging {batch_size} sequences of length {input_len} "
+            f"into 1 sequence of length {len(merged_input_ids)} "
+            f"(threshold: {merge_small_batches_threshold})"
+        )
+        req = Req(
+            rid=0,
+            origin_input_text="",
+            origin_input_ids=merged_input_ids,
+            sampling_params=sampling_params,
+        )
+        req.fill_ids = req.origin_input_ids
+        req.logprob_start_len = -1
+        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+        # Mark this as a merged request for debugging
+        req._is_merged_batch = True
+        req._original_batch_size = batch_size
+        req._original_input_len = input_len
+        return [req]
 
     reqs = []
     for i in range(len(input_ids)):
@@ -462,8 +692,13 @@ def correctness_test(
     )
     rank_print(f"\n{input_ids=}\n")
 
+    # Check if using dual runner mode
+    is_dual_runner = isinstance(model_runner, DualModelRunner)
+    
     if bench_args.cut_len > 0:
-        # Prefill
+        # Prefill - use FP4 runner for prefill
+        if is_dual_runner:
+            model_runner.switch_runner("fp4")
         next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
         rank_print(f"prefill logits (first half): {next_token_logits} \n")
 
@@ -472,10 +707,17 @@ def correctness_test(
         bench_args, input_ids, reqs, model_runner
     )
 
-    # Extend (prefill w/ KV cache)
+    # Extend (prefill w/ KV cache) - use FP4 runner for prefill
+    if is_dual_runner:
+        model_runner.switch_runner("fp4")
     next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
     rank_print(f"prefill logits (final): {next_token_logits} \n")
 
+    # Decode - use INT4 runner for decode
+    if is_dual_runner:
+        model_runner.switch_runner("int4")
+        rank_print("[DualRunner] Switched to INT4 for decode")
+    
     # Decode
     output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
     for _ in range(bench_args.output_len[0] - 1):
@@ -488,6 +730,9 @@ def correctness_test(
     for i in range(len(reqs)):
         rank_print(f"========== Prompt {i} ==========")
         rank_print(tokenizer.decode(output_ids[i]), "\n")
+
+    # Always destroy distributed environment if it was initialized
+    destroy_distributed_environment()
 
 
 def synchronize(device):
@@ -510,6 +755,7 @@ def latency_test_run_once(
     profile_filename_prefix,
     profile_stage,
     tp_rank,
+    tokenizer=None,
 ):
     max_batch_size = model_runner.max_total_num_tokens // (input_len + output_len)
     if batch_size > max_batch_size:
@@ -529,6 +775,15 @@ def latency_test_run_once(
     }
 
     tot_latency = 0
+
+    # Check if using dual runner mode
+    is_dual_runner = isinstance(model_runner, DualModelRunner)
+    
+    # For prefill: switch to FP4 runner
+    if is_dual_runner:
+        model_runner.switch_runner("fp4")
+        if rank_print:
+            rank_print(f"[DualRunner] Switched to FP4 for prefill")
 
     profiler = None
     enable_profile_prefill = profile and profile_stage in ["all", "prefill"]
@@ -566,7 +821,14 @@ def latency_test_run_once(
     measurement_results["prefill_latency"] = prefill_latency
     measurement_results["prefill_throughput"] = throughput
 
+    # For decode: switch to INT4 runner
+    if is_dual_runner:
+        model_runner.switch_runner("int4")
+        if rank_print:
+            rank_print(f"[DualRunner] Switched to INT4 for decode")
+
     decode_latencies = []
+    decode_token_ids = [next_token_ids.tolist()]  # Store generated tokens
     profile_step_of_interest = output_len // 2
     enable_profile_decode = profile and profile_stage in ["all", "decode"]
     for i in range(output_len - 1):
@@ -583,6 +845,9 @@ def latency_test_run_once(
         next_token_ids, _ = decode(next_token_ids, batch, model_runner)
         synchronize(device)
         latency = time.perf_counter() - tic
+        
+        # Store generated token
+        decode_token_ids.append(next_token_ids.tolist())
 
         if enable_profile_decode and i == profile_step_of_interest:
             trace_filename = _create_torch_profiler_filename(
@@ -604,6 +869,16 @@ def latency_test_run_once(
             rank_print(
                 f"Decode {i}. Batch size: {batch_size}, latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
             )
+    
+    # Print decode result
+    rank_print(f"\nDecode result (batch_size={batch_size}):")
+    for b in range(min(batch_size, 2)):  # Print first 2 sequences
+        tokens = [decode_token_ids[i][b] for i in range(len(decode_token_ids))]
+        if tokenizer:
+            text = tokenizer.decode(tokens, skip_special_tokens=True)
+            rank_print(f"  Sequence {b} text: {text[:100]}...")
+        else:
+            rank_print(f"  Sequence {b} token IDs: {tokens[:10]}... (len={len(tokens)})")
 
     # Record decode timing from 2nd output
     if output_len > 1:
@@ -649,7 +924,8 @@ def latency_test(
 
     # Prepare inputs for warm up
     reqs = prepare_synthetic_inputs_for_latency_test(
-        bench_args.batch_size[0], bench_args.input_len[0]
+        bench_args.batch_size[0], bench_args.input_len[0],
+        merge_small_batches_threshold=bench_args.merge_small_batches_threshold
     )
 
     # Warm up
@@ -670,6 +946,7 @@ def latency_test(
         profile_filename_prefix="",
         profile_stage="all",
         tp_rank=tp_rank,
+        tokenizer=tokenizer,
     )
 
     rank_print("Benchmark ...")
@@ -703,7 +980,10 @@ def latency_test(
                     [bs_aligned_inputs[-1]] * (bs - custom_input_len)
                 )
 
-        reqs = prepare_synthetic_inputs_for_latency_test(bs, il, bs_aligned_inputs)
+        reqs = prepare_synthetic_inputs_for_latency_test(
+            bs, il, bs_aligned_inputs,
+            merge_small_batches_threshold=bench_args.merge_small_batches_threshold
+        )
         ret = latency_test_run_once(
             bench_args.run_name,
             model_runner,
@@ -720,6 +1000,7 @@ def latency_test(
             bench_args.profile_filename_prefix,
             bench_args.profile_stage,
             tp_rank,
+            tokenizer,
         )
         if ret is not None:
             result_list.append(ret)
@@ -730,8 +1011,8 @@ def latency_test(
             for result in result_list:
                 fout.write(json.dumps(result) + "\n")
 
-    if server_args.tp_size > 1:
-        destroy_distributed_environment()
+    # Always destroy distributed environment if it was initialized
+    destroy_distributed_environment()
 
 
 def main(server_args, bench_args):
@@ -774,7 +1055,10 @@ def main(server_args, bench_args):
         for proc in workers:
             proc.join()
 
-        proc.terminate()
+        for proc in workers:
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=1)
 
 
 if __name__ == "__main__":
