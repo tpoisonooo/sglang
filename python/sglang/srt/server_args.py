@@ -782,23 +782,23 @@ class ServerArgs:
             self.load_balance_method = "follow_bootstrap_room"
 
     def _handle_dual_model_detection(self):
-        """Auto-detect dual model structure (model_path/fp4 and model_path/int4).
+        """Auto-detect dual model structure (model_path as fp4 and model_path/int4).
         
-        If detected, enable_dynamic_quant is set to True and model_path is updated
-        to point to the fp4 subdirectory for model config loading.
+        If detected, enable_dynamic_quant is set to True.
+        The model_path itself is used as FP4 model, and int4 subdirectory is for INT4.
         """
         import os
         
-        fp4_path = os.path.join(self.model_path, "fp4")
+        # Check if int4 subdirectory exists (fp4 is now the model_path itself)
         int4_path = os.path.join(self.model_path, "int4")
         
-        if os.path.isdir(fp4_path) and os.path.isdir(int4_path):
-            logger.info(f"Detected dual model structure: {self.model_path}")
+        if os.path.isdir(int4_path):
+            logger.info(f"Detected dual model structure: {self.model_path} (fp4) + {int4_path} (int4)")
             self.enable_dynamic_quant = True
-            # Store original path and update model_path to fp4 for config loading
+            # Store original path as the dual model base path
             self._dual_model_base_path = self.model_path
-            self.model_path = fp4_path
-            logger.info(f"Using FP4 model for config: {self.model_path}")
+            # model_path stays as is (points to fp4 model directly)
+            logger.info(f"Using FP4 model from: {self.model_path}")
 
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers

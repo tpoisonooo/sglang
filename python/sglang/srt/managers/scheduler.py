@@ -304,10 +304,10 @@ class Scheduler(
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         
         # Dynamic quantization: auto-detect dual model structure
+        # model_path itself is fp4, int4 is in subdirectory
         import os
-        fp4_path = os.path.join(server_args.model_path, "fp4")
         int4_path = os.path.join(server_args.model_path, "int4")
-        if os.path.isdir(fp4_path) and os.path.isdir(int4_path):
+        if os.path.isdir(int4_path):
             self.enable_dynamic_quant = True
         else:
             self.enable_dynamic_quant = getattr(server_args, 'enable_dynamic_quant', False)

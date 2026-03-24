@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Parse arguments
 INPUT_PATH=""
 OUTPUT_PATH=""
-USE_LOCAL=true  # 默认从 HuggingFace 下载
+USE_LOCAL=false  # 默认从 HuggingFace 下载
 LOCAL_SOURCE_DIR="/root/models/openbmb/dual"
 
 while [[ $# -gt 0 ]]; do
@@ -43,7 +43,7 @@ export HF_ENDPOINT=https://hf-mirror.com
 
 # HuggingFace 仓库配置
 # TODO: 上传模型到 HuggingFace 后修改以下配置
-REMOTE_REPO="tpoisonooo/dual0323"  # 需要上传到的仓库名
+REMOTE_REPO="tpoisonooo/dual0324"  # 需要上传到的仓库名
 
 # 期望的 MD5 校验值
 # FP4 模型
@@ -99,9 +99,9 @@ copy_model_files() {
         return 1
     fi
     
-    # 检查是否包含 fp4 和 int4 子目录
-    if [[ ! -d "$source_dir/fp4" ]] || [[ ! -d "$source_dir/int4" ]]; then
-        echo "[prepare_model] Error: Source directory must contain 'fp4' and 'int4' subdirectories"
+    # 检查是否包含 int4 子目录 (fp4 文件直接在 source_dir 中)
+    if [[ ! -d "$source_dir/int4" ]]; then
+        echo "[prepare_model] Error: Source directory must contain 'int4' subdirectory (fp4 is in root)"
         return 1
     fi
     
@@ -113,13 +113,15 @@ copy_model_files() {
     # 创建目标目录并复制
     mkdir -p "$local_dir"
     
-    # 复制 fp4 和 int4 子目录
+    # 复制 fp4 文件 (直接在 source_dir 中) 到目标目录根
     local copy_ok=true
-    if ! cp -r "${source_dir}/fp4" "$local_dir/"; then
-        echo "[prepare_model] Error: Failed to copy fp4 directory"
+    echo "[prepare_model] Copying fp4 files from ${source_dir}..."
+    if ! cp -r "${source_dir}"/* "$local_dir/" 2>/dev/null; then
+        echo "[prepare_model] Error: Failed to copy fp4 files"
         copy_ok=false
     fi
     
+    # 复制 int4 子目录
     if ! cp -r "${source_dir}/int4" "$local_dir/"; then
         echo "[prepare_model] Error: Failed to copy int4 directory"
         copy_ok=false
@@ -166,7 +168,12 @@ check_model_files() {
     local expected_md5_1="$3"
     local expected_md5_2="$4"
     
-    local model_dir="${base_dir}/${model_type}"
+    # fp4 模型文件直接在 base_dir 中，int4 在子目录中
+    if [[ "$model_type" == "fp4" ]]; then
+        local model_dir="${base_dir}"
+    else
+        local model_dir="${base_dir}/${model_type}"
+    fi
     local model_file_1="${model_dir}/model-00001-of-00002.safetensors"
     local model_file_2="${model_dir}/model-00002-of-00002.safetensors"
     
@@ -207,9 +214,9 @@ check_existing_model() {
     
     echo "[prepare_model] Found existing model directory, verifying..."
     
-    # 检查 fp4 和 int4 子目录
-    if [[ ! -d "$output_dir/fp4" ]] || [[ ! -d "$output_dir/int4" ]]; then
-        echo "[prepare_model] Missing fp4 or int4 subdirectory."
+    # 检查 int4 子目录 (fp4 文件直接在 output_dir 中)
+    if [[ ! -d "$output_dir/int4" ]]; then
+        echo "[prepare_model] Missing int4 subdirectory."
         return 1
     fi
     

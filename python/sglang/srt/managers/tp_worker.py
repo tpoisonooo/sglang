@@ -250,14 +250,14 @@ class TpModelWorker(BaseTpWorker):
             dual_base = getattr(self.server_args, '_dual_model_base_path', None)
             check_path = dual_base or self.server_args.model_path
             
-            fp4_path = os.path.join(check_path, "fp4")
+            # Check for int4 subdirectory (fp4 is the model_path itself)
             int4_path = os.path.join(check_path, "int4")
-            if os.path.isdir(fp4_path) and os.path.isdir(int4_path):
+            if os.path.isdir(int4_path):
                 if dual_base is None:
-                    logger.info(f"Detected dual model structure: {check_path}")
+                    logger.info(f"Detected dual model structure: {check_path} (fp4) + {int4_path} (int4)")
                     self.enable_dynamic_quant = True
-                # Store paths for later use
-                self._dual_fp4_path = fp4_path
+                # Store paths for later use: fp4 is check_path itself, int4 is the subdirectory
+                self._dual_fp4_path = check_path
                 self._dual_int4_path = int4_path
             else:
                 self._dual_fp4_path = None
@@ -404,7 +404,8 @@ class TpModelWorker(BaseTpWorker):
         import os
         dual_base = getattr(self.server_args, '_dual_model_base_path', None)
         if dual_base:
-            fp4_path = os.path.join(dual_base, "fp4")
+            # dual_base is the fp4 path itself, int4 is in subdirectory
+            fp4_path = dual_base
             int4_path = os.path.join(dual_base, "int4")
         else:
             # Fallback to explicit paths or model_path
