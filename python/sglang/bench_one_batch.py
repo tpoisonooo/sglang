@@ -171,7 +171,7 @@ class BenchArgs:
     result_filename: str = "result.jsonl"
     correctness_test: bool = False
     # This is only used for correctness test
-    cut_len: int = 4
+    cut_len: int = 0  # Default to 0 for dual runner compatibility
     log_decode_step: int = 0
     profile: bool = False
     profile_record_shapes: bool = False
@@ -339,12 +339,12 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         from sglang.srt.distributed.parallel_state import destroy_model_parallel
         
         # Split memory between two runners
-        # INT4 runner loads first with smaller memory (only needs decode KV cache)
-        # FP4 runner loads second and needs larger mem_fraction for prefill
-        int4_mem_fraction = 0.40
-        fp4_mem_fraction = 0.75
+        # INT4 runner loads first and owns the memory pools
+        # FP4 runner loads second and shares INT4's memory pools for KV cache consistency
+        int4_mem_fraction = 0.80  # INT4 owns memory pools, needs enough for KV cache
+        fp4_mem_fraction = 0.80  # FP4 shares pools, just needs enough for model weights
         
-        # 1. Load INT4 runner first (for decode)
+        # 1. Load INT4 runner first (for decode) - owns memory pools
         set_z_proj_quant_enabled(False)
         
         int4_server_args = copy.deepcopy(server_args)
@@ -377,7 +377,7 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         
         rank_print(f"INT4 runner initialized (for decode)")
         
-        # 2. Load FP4 runner (for prefill)
+        # 2. Load FP4 runner (for prefill) - shares INT4's memory pools
         # Must reset distributed state for second runner
         from sglang.srt.distributed.parallel_state import destroy_distributed_environment
         destroy_model_parallel()
@@ -388,6 +388,7 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         fp4_server_args = copy.deepcopy(server_args)
         fp4_server_args.model_path = fp4_path
         fp4_server_args.quantization = "modelopt_fp4"
+        fp4_server_args.dtype = "half"  # Match INT4 dtype
         
         rank_print(f"[DualRunner] Loading FP4 runner from: {fp4_path}")
         rank_print(f"[DualRunner] FP4 quantization: {fp4_server_args.quantization}")
@@ -398,8 +399,9 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         )
         rank_print(f"[DualRunner] FP4 config quantization: {fp4_model_config.quantization}")
         
-        # Create FP4 runner with its own memory pool
+        # Create FP4 runner sharing INT4's memory pools for KV cache consistency
         fp4_server_args.mem_fraction_static = fp4_mem_fraction
+        rank_print(f"[DualRunner] Creating FP4 runner with shared memory pools from INT4")
         fp4_runner = ModelRunner(
             model_config=fp4_model_config,
             mem_fraction_static=fp4_mem_fraction,
@@ -412,7 +414,14 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
             pp_size=1,
             nccl_port=port_args.nccl_port,
             server_args=fp4_server_args,
+            req_to_token_pool=int4_runner.req_to_token_pool,
+            token_to_kv_pool_allocator=int4_runner.token_to_kv_pool_allocator,
         )
+        
+        # Also share token_to_kv_pool and attn_backend references
+        fp4_runner.token_to_kv_pool = int4_runner.token_to_kv_pool
+        fp4_runner.attn_backend = int4_runner.attn_backend
+        rank_print(f"[DualRunner] Shared token_to_kv_pool and attn_backend between runners")
         
         rank_print(f"FP4 runner initialized (for prefill)")
         
@@ -683,8 +692,13 @@ def correctness_test(
     )
     rank_print(f"\n{input_ids=}\n")
 
+    # Check if using dual runner mode
+    is_dual_runner = isinstance(model_runner, DualModelRunner)
+    
     if bench_args.cut_len > 0:
-        # Prefill
+        # Prefill - use FP4 runner for prefill
+        if is_dual_runner:
+            model_runner.switch_runner("fp4")
         next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
         rank_print(f"prefill logits (first half): {next_token_logits} \n")
 
@@ -693,10 +707,17 @@ def correctness_test(
         bench_args, input_ids, reqs, model_runner
     )
 
-    # Extend (prefill w/ KV cache)
+    # Extend (prefill w/ KV cache) - use FP4 runner for prefill
+    if is_dual_runner:
+        model_runner.switch_runner("fp4")
     next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
     rank_print(f"prefill logits (final): {next_token_logits} \n")
 
+    # Decode - use INT4 runner for decode
+    if is_dual_runner:
+        model_runner.switch_runner("int4")
+        rank_print("[DualRunner] Switched to INT4 for decode")
+    
     # Decode
     output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
     for _ in range(bench_args.output_len[0] - 1):

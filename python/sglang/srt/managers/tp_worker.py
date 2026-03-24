@@ -502,7 +502,7 @@ class TpModelWorker(BaseTpWorker):
         
         # Also share token_to_kv_pool, attn_backend and sampler directly
         self._fp4_model_runner.token_to_kv_pool = self._int4_model_runner.token_to_kv_pool
-        #self._fp4_model_runner.attn_backend = self._int4_model_runner.attn_backend
+        self._fp4_model_runner.attn_backend = self._int4_model_runner.attn_backend
         self._fp4_model_runner.sampler = self._int4_model_runner.sampler
         #if hasattr(self._int4_model_runner, 'decode_attn_backend'):
         #    self._fp4_model_runner.decode_attn_backend = self._int4_model_runner.decode_attn_backend

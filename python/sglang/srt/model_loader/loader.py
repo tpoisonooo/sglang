@@ -2475,6 +2475,22 @@ class ModelOptModelLoader(DefaultModelLoader):
 
             # Apply quantization
             mtq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
+            
+            # Disable quantization for z_proj layers (heterogeneous layer in LightningAttention)
+            # This must be done after quantization setup but before calibration
+            disabled_count = 0
+            for name, module in model.named_modules():
+                if 'z_proj' in name and hasattr(module, 'weight_quantizer'):
+                    if hasattr(module.weight_quantizer, 'disable'):
+                        module.weight_quantizer.disable()
+                        disabled_count += 1
+                    # Also disable input/output quantizers if they exist
+                    if hasattr(module, 'input_quantizer') and hasattr(module.input_quantizer, 'disable'):
+                        module.input_quantizer.disable()
+                    if hasattr(module, 'output_quantizer') and hasattr(module.output_quantizer, 'disable'):
+                        module.output_quantizer.disable()
+            if disabled_count > 0:
+                print(f"🚫 Disabled quantization for {disabled_count} z_proj layers")
 
             if (
                 not model_parallel_is_initialized()

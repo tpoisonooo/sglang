@@ -267,7 +267,7 @@ python3 -m sglang.bench_one_batch \
 
 --cuda-graph-max-bs 1
 
-python3 -m sglang.bench_one_batch         --model /root/models/openbmb/dual         --trust-remote-code         --disable-radix-cache         --attention-backend flashinfer         --batch 1         --input-len 8         --output-len 16         --cuda-graph-max-bs 1         --disable-cuda-graph         --prompt-filename /tmp/prompt.txt 
+python3 -m sglang.bench_one_batch         --model /root/models/openbmb/dual         --trust-remote-code         --disable-radix-cache         --attention-backend flashinfer         --batch 1          --output-len 512         --cuda-graph-max-bs 1         --disable-cuda-graph         --prompt-filename /tmp/prompt.txt 
 
 python3 -m sglang.launch_server \
       --model /root/models/openbmb/dual \
@@ -284,3 +284,5 @@ python3 -m sglang.launch_server \
       --attention-backend flashinfer \
       --dtype half \
       --disable-cuda-graph
+
+python3 quantize_fp4.py quantize --model-path /root/models/openbmb/MiniCPM-SALA-sdpa/  --export-dir /root/models/openbmb/dual/fp4/  --skip-first-n-layers 1 --skip-last-n-layers 1

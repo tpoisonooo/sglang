@@ -2645,6 +2645,18 @@ class ModelOptModelLoader(DefaultModelLoader):
                 skip_last_n=skip_last_n,
                 layer_prefix=layer_prefix,
             )
+        
+        # Exclude z_proj from quantization (heterogeneous layer in LightningAttention)
+        # z_proj only exists in linear attention layers and should not be quantized
+        # to maintain accuracy. This applies to both model and turtle_model.
+        import copy
+        quant_cfg = copy.deepcopy(quant_cfg)
+        # Pattern matches z_proj in any nested structure (model.layers.X.self_attn.z_proj
+        # or turtle_model.model.layers.X.self_attn.z_proj)
+        quant_cfg['quant_cfg']['*.self_attn.z_proj'] = {'enable': False}
+        quant_cfg['quant_cfg']['*.*.self_attn.z_proj'] = {'enable': False}
+        quant_cfg['quant_cfg']['*.*.*.self_attn.z_proj'] = {'enable': False}
+        logger.info("Excluding z_proj layers from quantization (heterogeneous linear attention layer)")
 
         logger.info(
             f"Quantizing model with ModelOpt using config: mtq.{quant_cfg_name}"

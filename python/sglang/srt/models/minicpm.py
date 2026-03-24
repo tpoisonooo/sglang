@@ -330,7 +330,8 @@ class MiniCPMLightningMixer(nn.Module):
 
         if self.use_output_gate:
             # z_proj quant_config is controlled by global flag for dynamic quantization
-            z_proj_quant_config = get_z_proj_quant_config(quant_config)
+            # z_proj_quant_config = get_z_proj_quant_config(quant_config)
+            z_proj_quant_config = None 
             self.z_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.total_num_heads * self.head_dim,

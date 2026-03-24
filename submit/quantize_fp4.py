@@ -52,17 +52,37 @@ def register_lightning_attention_quantization():
             
             def _setup(self):
                 """Setup quantizers for LightningAttention's Linear layers and recurrent state."""
+                import modelopt.torch.quantization as mtq
+                
                 # Input quantizers for each projection (weight quantization)
                 self.q_proj_input_quantizer = TensorQuantizer()
                 self.k_proj_input_quantizer = TensorQuantizer()
                 self.v_proj_input_quantizer = TensorQuantizer()
                 self.o_proj_input_quantizer = TensorQuantizer()
                 
-                # Recurrent state quantizers (KV Cache equivalent for GLA)
-                self.recurrent_state_quantizer = TensorQuantizer()
-                self.q_attn_quantizer = TensorQuantizer()
-                self.k_attn_quantizer = TensorQuantizer()
-                self.v_attn_quantizer = TensorQuantizer()
+                # Note: Recurrent state quantization is disabled to preserve accuracy
+                # GLA's recurrent state is sensitive to quantization errors due to its
+                # accumulative nature - small errors can accumulate over time.
+                # self.recurrent_state_quantizer = TensorQuantizer()
+                # self.q_attn_quantizer = TensorQuantizer()
+                # self.k_attn_quantizer = TensorQuantizer()
+                # self.v_attn_quantizer = TensorQuantizer()
+                
+                # Disable quantization for z_proj (heterogeneous layer - only in linear attn)
+                # z_proj is used for output gating and should remain in original precision
+                if hasattr(self, 'z_proj') and self.z_proj is not None:
+                    # Use ModelOpt API to completely disable quantization for z_proj
+                    try:
+                        mtq.disable_quantization(self.z_proj)
+                        print(f"   Disabled quantization for z_proj in layer {getattr(self, 'layer_idx', 'unknown')}")
+                    except Exception as e:
+                        # Fallback: manually disable quantizers if mtq.disable_quantization fails
+                        if hasattr(self.z_proj, 'weight_quantizer'):
+                            self.z_proj.weight_quantizer.disable()
+                        if hasattr(self.z_proj, 'input_quantizer'):
+                            self.z_proj.input_quantizer.disable()
+                        if hasattr(self.z_proj, 'output_quantizer'):
+                            self.z_proj.output_quantizer.disable()
                 
             def forward(
                 self,
@@ -113,14 +133,14 @@ def register_lightning_attention_quantization():
                 v = rearrange(v, "b h t d -> b t h d").to(torch.float32)
                 s = s.to(torch.float32)
                 
-                # Apply attention input quantizers (KV Cache quantization equivalent)
-                q = self.q_attn_quantizer(q)
-                k = self.k_attn_quantizer(k)
-                v = self.v_attn_quantizer(v)
+                # Note: Recurrent state quantization is disabled to preserve accuracy
+                # q = self.q_attn_quantizer(q)
+                # k = self.k_attn_quantizer(k)
+                # v = self.v_attn_quantizer(v)
                 
-                # Quantize initial recurrent state if present
-                if initial_state is not None:
-                    initial_state = self.recurrent_state_quantizer(initial_state)
+                # Note: Recurrent state quantization is disabled
+                # if initial_state is not None:
+                #     initial_state = self.recurrent_state_quantizer(initial_state)
 
                 # Call the custom attention function
                 o, final_state = self.attn_fn(
@@ -133,9 +153,9 @@ def register_lightning_attention_quantization():
                     attention_mask=attention_mask,
                 )
                 
-                # Quantize final recurrent state before returning
-                if final_state is not None:
-                    final_state = self.recurrent_state_quantizer(final_state)
+                # Note: Recurrent state quantization is disabled
+                # if final_state is not None:
+                #     final_state = self.recurrent_state_quantizer(final_state)
 
                 if past_key_value is not None:
                     past_key_value.layers[self.layer_idx].update(
@@ -208,8 +228,62 @@ def register_lightning_attention_quantization():
         return None
 
 
-# Global variable to hold the custom quant class
+# =============================================================================
+# Custom Quantization Module for MiniCPMMLP
+# =============================================================================
+# MLP layers (gate_proj, up_proj, down_proj) need to be quantized for
+# full int4/fp8 quantization benefits.
+
+def register_mlp_quantization():
+    """Register custom quantization module for MiniCPMMLP."""
+    try:
+        import modelopt.torch.quantization as mtq
+        from modelopt.torch.quantization.nn import QuantModule, TensorQuantizer
+        from modelopt.torch.quantization.conversion import register
+        
+        class QuantMiniCPMMLP(QuantModule):
+            """
+            Quantized MiniCPMMLP module.
+            
+            This module quantizes the three Linear layers:
+            - gate_proj: input quantizer
+            - up_proj: input quantizer
+            - down_proj: input and output quantizer
+            """
+            
+            def _setup(self):
+                """Setup quantizers for MLP's Linear layers."""
+                # Input quantizers for each projection (weight quantization)
+                self.gate_proj_input_quantizer = TensorQuantizer()
+                self.up_proj_input_quantizer = TensorQuantizer()
+                self.down_proj_input_quantizer = TensorQuantizer()
+                
+            def forward(self, x):
+                """Forward with quantized Linear layers."""
+                # Quantize inputs before Linear projections
+                gate = self.gate_proj(self.gate_proj_input_quantizer(x))
+                up = self.up_proj(self.up_proj_input_quantizer(x))
+                
+                # Activation function (SiLU) and multiplication
+                # x = down_proj(act(gate_proj(x)) * up_proj(x))
+                activated_gate = self.act_fn(gate)
+                intermediate = activated_gate * up
+                
+                # Quantize input before down_proj
+                output = self.down_proj(self.down_proj_input_quantizer(intermediate))
+                return output
+        
+        print("✅ Custom QuantMiniCPMMLP defined successfully")
+        return QuantMiniCPMMLP
+        
+    except ImportError as e:
+        print(f"⚠️  ModelOpt not available for MLP quantization: {e}")
+        return None
+
+
+# Global variables to hold the custom quant classes
 _QuantLightningAttention = register_lightning_attention_quantization()
+_QuantMiniCPMMLP = register_mlp_quantization()
 
 
 def _validate_export(export_dir: str) -> bool:
@@ -349,6 +423,25 @@ def quantize_and_export_model(
                     print(f"⚠️  Could not register to QuantModuleRegistry: {e}")
             else:
                 print("ℹ️  LightningAttention will use default quantization (no custom module)")
+            
+            # Get MiniCPMMLP class and register custom quantization
+            if hasattr(modeling_module, "MiniCPMMLP") and _QuantMiniCPMMLP is not None:
+                import modelopt.torch.quantization as mtq
+                from modelopt.torch.quantization.conversion import register
+                MiniCPMMLP = modeling_module.MiniCPMMLP
+                mtq.register(MiniCPMMLP, _QuantMiniCPMMLP)
+                print(f"✅ Registered custom weight quantization for {MiniCPMMLP}")
+                
+                # Also register to QuantModuleRegistry
+                try:
+                    from modelopt.torch.quantization.nn import QuantModuleRegistry
+                    if QuantModuleRegistry.get(MiniCPMMLP) is None:
+                        QuantModuleRegistry.register({MiniCPMMLP: "MiniCPMMLP"})(_QuantMiniCPMMLP)
+                        print(f"✅ Registered MiniCPMMLP to QuantModuleRegistry")
+                except Exception as e:
+                    print(f"⚠️  Could not register MiniCPMMLP to QuantModuleRegistry: {e}")
+            else:
+                print("ℹ️  MiniCPMMLP will use default quantization (no custom module)")
             
             # Note about KV Cache quantization
             print("""
@@ -505,7 +598,7 @@ Examples:
     quantize_parser.add_argument(
         "--quantization-method",
         choices=["modelopt_fp8", "modelopt_fp4"],
-        default="modelopt_fp8",
+        default="modelopt_fp4",
         help="Quantization method to use. Note: FP4 only supports group_size=16 (hardware limitation)",
     )
     quantize_parser.add_argument(
