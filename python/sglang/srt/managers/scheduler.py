@@ -2210,10 +2210,6 @@ class Scheduler(
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
         
-        # Dynamic quantization: switch between FP4 and INT4 based on batch characteristics
-        if self.enable_dynamic_quant:
-            self._select_optimal_quantization(batch)
-        
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
@@ -2344,34 +2340,6 @@ class Scheduler(
                 req.time_stats.prefill_end_time_host = current_time
 
         return ret
-
-    def _select_optimal_quantization(self, batch: ScheduleBatch):
-        """Select optimal quantization (FP4 or INT4) based on forward mode.
-        
-        Strategy: Prefill-Decode Separation
-        - FP4 for PREFILL (EXTEND mode): high throughput for parallel computation
-        - INT4 for DECODE: fast low-latency token generation
-        """
-        from sglang.srt.managers.schedule_batch import ForwardMode
-        
-        # Determine target runner based on forward mode
-        if batch.forward_mode == ForwardMode.EXTEND:
-            # Prefill phase: use FP4 for high throughput
-            target_type = "fp4"
-        elif batch.forward_mode.is_decode():
-            # Decode phase: use INT4 for fast generation
-            target_type = "int4"
-        else:
-            # Other modes: keep current
-            return
-        
-        current_type = self.tp_worker.active_runner_type
-        if target_type != current_type:
-            logger.info(
-                f"[DualRunner] Switching: {current_type.upper()} -> {target_type.upper()} | "
-                f"mode={batch.forward_mode.name}, batch_size={len(batch.reqs)}"
-            )
-            self.tp_worker.switch_model_runner(target_type)
 
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult

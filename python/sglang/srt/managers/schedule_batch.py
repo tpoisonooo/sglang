@@ -2338,7 +2338,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             total_compress_k2_token_nums_cpu=self.total_compress_k2_token_nums_cpu,
             cu_total_compress_k2_token_nums_cpu=self.cu_total_compress_k2_token_nums_cpu,
             cache_seqlens_int32_stage1_cpu=self.cache_seqlens_int32_stage1_cpu,
-
+            decoding_reqs=self.decoding_reqs,
         )
 
     def copy(self):
@@ -2472,6 +2472,9 @@ class ModelWorkerBatch:
     # FIXME(lsyin): remove this after fully overlap grammar
     reqs: Optional[List[Req]] = None
     has_grammar: bool = False
+    
+    # For dynamic quantization: decode requests in MIXED mode
+    decoding_reqs: Optional[List[Req]] = None
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False

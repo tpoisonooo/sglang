@@ -564,37 +564,40 @@ class TpModelWorker(BaseTpWorker):
         self.token_to_kv_pool_allocator = self._int4_model_runner.token_to_kv_pool_allocator
         logger.info("Dynamic quantization ready: Prefill-Decode separation (default INT4, scheduler uses INT4 memory pools)")
 
-    def switch_model_runner(self, runner_type: str):
-        """Switch between FP4 and INT4 model runners.
+    def get_model_runner_for_forward_mode(self, forward_mode) -> "ModelRunner":
+        """Get the appropriate model runner based on forward mode.
+        
+        Strategy: Prefill-Decode Separation
+        - FP4 for EXTEND/PREFILL/SPLIT_PREFILL/MIXED: high throughput for parallel computation
+          MIXED mode contains prefill requests, so use FP4 for better accuracy
+        - INT4 for DECODE: fast low-latency token generation
         
         Args:
-            runner_type: "fp4" or "int4"
+            forward_mode: The ForwardMode of the batch
+            
+        Returns:
+            The appropriate ModelRunner (FP4 or INT4)
         """
         if not self.enable_dynamic_quant:
-            return
-            
-        if runner_type == self._active_runner_type:
-            return
+            return self._model_runner
         
-        if runner_type == "fp4":
-            if self._fp4_model_runner is None:
-                logger.warning("FP4 runner not available")
-                return
-            self._model_runner = self._fp4_model_runner
-            self._active_runner_type = "fp4"
-            # Verify memory pool sharing
-            int4_pool_id = id(self._int4_model_runner.token_to_kv_pool)
-            fp4_pool_id = id(self._fp4_model_runner.token_to_kv_pool)
-            logger.info(f"[DualRunner] Switched to FP4 | KV pool INT4: {int4_pool_id}, FP4: {fp4_pool_id}, shared: {int4_pool_id == fp4_pool_id}")
-        elif runner_type == "int4":
-            if self._int4_model_runner is None:
-                logger.warning("INT4 runner not available")
-                return
-            self._model_runner = self._int4_model_runner
-            self._active_runner_type = "int4"
-            logger.info(f"[DualRunner] Switched to INT4 runner (batch size hint: low)")
-        else:
-            logger.warning(f"Unknown runner type: {runner_type}")
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        
+        # For prefill modes (EXTEND, SPLIT_PREFILL, DLLM_EXTEND, MIXED), use FP4
+        # MIXED mode contains prefill requests, so use FP4 for better accuracy
+        # For pure decode mode (DECODE), use INT4
+        if forward_mode in (ForwardMode.EXTEND, ForwardMode.SPLIT_PREFILL, ForwardMode.DLLM_EXTEND, ForwardMode.MIXED):
+            if self._fp4_model_runner is not None:
+                logger.info(f"[DualRunner] get_model_runner: forward_mode={forward_mode.name} -> FP4")
+                return self._fp4_model_runner
+        elif forward_mode == ForwardMode.DECODE:
+            if self._int4_model_runner is not None:
+                logger.info(f"[DualRunner] get_model_runner: forward_mode={forward_mode.name} -> INT4")
+                return self._int4_model_runner
+        
+        # Default fallback
+        logger.info(f"[DualRunner] get_model_runner: forward_mode={forward_mode.name} -> default ({self._get_runner_type(self._model_runner)})")
+        return self._model_runner
 
     @property
     def active_runner_type(self) -> str:
@@ -638,6 +641,16 @@ class TpModelWorker(BaseTpWorker):
     @property
     def model_runner(self) -> "ModelRunner":
         return self._model_runner
+
+    def _get_runner_type(self, model_runner: "ModelRunner") -> str:
+        """Get the type of a model runner (fp4 or int4)."""
+        if not self.enable_dynamic_quant:
+            return "default"
+        if model_runner is self._fp4_model_runner:
+            return "fp4"
+        elif model_runner is self._int4_model_runner:
+            return "int4"
+        return "unknown"
 
     def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
         self.hicache_layer_transfer_counter = counter
@@ -698,16 +711,36 @@ class TpModelWorker(BaseTpWorker):
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
 
-            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            # Select model runner based on forward mode for dynamic quantization
+            # This ensures correct runner is used for each batch type
+            model_runner = self.model_runner
+            if self.enable_dynamic_quant:
+                model_runner = self.get_model_runner_for_forward_mode(model_worker_batch.forward_mode)
+                runner_type = self._get_runner_type(model_runner)
+                logger.info(
+                    f"[DualRunner] forward_batch_generation: using {runner_type} for "
+                    f"forward_mode={model_worker_batch.forward_mode.name}, batch_size={len(model_worker_batch.seq_lens)}"
+                )
+            
+            forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
+            # Select model runner based on forward mode for dynamic quantization
+            model_runner = self.model_runner
+            if self.enable_dynamic_quant:
+                model_runner = self.get_model_runner_for_forward_mode(forward_batch.forward_mode)
+                runner_type = self._get_runner_type(model_runner)
+                logger.info(
+                    f"[DualRunner] forward_batch_generation (from forward_batch): using {runner_type} for "
+                    f"forward_mode={forward_batch.forward_mode.name}, batch_size={forward_batch.batch_size}"
+                )
 
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch)
 
         if self.pp_group.is_last_rank:
-            out = self.model_runner.forward(
+            out = model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 skip_attn_backend_init=skip_attn_backend_init,
@@ -730,7 +763,7 @@ class TpModelWorker(BaseTpWorker):
             ):
 
                 def sample_batch_func():
-                    batch_result.next_token_ids = self.model_runner.sample(
+                    batch_result.next_token_ids = model_runner.sample(
                         logits_output, forward_batch
                     )
                     return batch_result
@@ -740,7 +773,7 @@ class TpModelWorker(BaseTpWorker):
 
             if not model_worker_batch.is_prefill_only:
                 # For normal requests, sample the next token ids.
-                batch_result.next_token_ids = self.model_runner.sample(
+                batch_result.next_token_ids = model_runner.sample(
                     logits_output, forward_batch
                 )
             else:
@@ -756,13 +789,13 @@ class TpModelWorker(BaseTpWorker):
                     and logits_output.next_token_logits is not None
                 ):
                     # NOTE: Compute logprobs without full sampling
-                    self.model_runner.compute_logprobs_only(
+                    model_runner.compute_logprobs_only(
                         logits_output, model_worker_batch
                     )
 
             return batch_result
         else:
-            out = self.model_runner.forward(
+            out = model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 skip_attn_backend_init=skip_attn_backend_init,
@@ -775,20 +808,31 @@ class TpModelWorker(BaseTpWorker):
             )
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
+        # Select model runner based on forward mode for dynamic quantization
+        # SPLIT_PREFILL is a prefill mode, so use FP4
+        model_runner = self.model_runner
+        if self.enable_dynamic_quant:
+            model_runner = self.get_model_runner_for_forward_mode(batch.forward_mode)
+            runner_type = self._get_runner_type(model_runner)
+            logger.info(
+                f"[DualRunner] forward_batch_split_prefill: using {runner_type} for "
+                f"forward_mode={batch.forward_mode.name}, batch_size={len(batch.reqs)}"
+            )
+        
         if batch.split_index == 0:
             model_worker_batch = batch.get_model_worker_batch()
-            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
             batch.split_forward_batch = forward_batch
             batch.seq_lens_cpu_cache = model_worker_batch.seq_lens_cpu
         else:
             model_worker_batch = batch.get_model_worker_batch(batch.seq_lens_cpu_cache)
 
-        out = self.model_runner.forward(
+        out = model_runner.forward(
             batch.split_forward_batch, split_forward_count=batch.split_forward_count
         )
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
         if logits_output:
-            next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+            next_token_ids = model_runner.sample(logits_output, model_worker_batch)
         else:
             next_token_ids = None
         batch_result = GenerationBatchResult(
