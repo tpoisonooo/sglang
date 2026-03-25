@@ -424,7 +424,7 @@ class TpModelWorker(BaseTpWorker):
         
         int4_server_args = copy.deepcopy(self.server_args)
         int4_server_args.model_path = int4_path
-        int4_server_args.quantization = "gptq"  # INT4 uses GPTQ/Marlin
+        # int4_server_args.quantization = "gptq"  # INT4 uses GPTQ/Marlin
         int4_server_args.dtype = "half"  # GPTQ requires float16
         # Keep tokenizer from FP4 model (shared tokenizer)
         int4_server_args.tokenizer_path = self.server_args.tokenizer_path

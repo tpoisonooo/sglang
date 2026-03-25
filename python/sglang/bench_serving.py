@@ -2783,8 +2783,6 @@ def run_benchmark(args_: argparse.Namespace):
     backend = args.backend
     model_id = args.served_model_name or args.model
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
-
-    print(f'!!!! {tokenizer_id}')
     tokenizer = get_tokenizer(tokenizer_id)
     input_requests = get_dataset(args, tokenizer, model_id)
 
@@ -2904,7 +2902,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tokenizer",
         type=str,
-        default='/data/share/MiniCPM-SALA',
         help="Name or path of the tokenizer. If not set, using the model conf.",
     )
     parser.add_argument(
